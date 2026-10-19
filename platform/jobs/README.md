@@ -14,7 +14,7 @@ platform reference. See TRD 18-01 for the side-by-side. Summary:
 ## Quickstart
 
 ```go
-import "github.com/aocybersystems/eden-platform-go/platform/jobs"
+import "go.aocyber.ai/eden-platform-go/platform/jobs"
 
 store := jobs.NewMemoryStore() // or jobs.NewPostgresStore(pgxPool)
 q := jobs.NewQueue(store)

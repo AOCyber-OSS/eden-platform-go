@@ -16,7 +16,7 @@ canonical implementation across the Eden portfolio. Beta (production-grade).
 ## Quickstart
 
 ```go
-import "github.com/aocybersystems/eden-platform-go/platform/encryption"
+import "go.aocyber.ai/eden-platform-go/platform/encryption"
 
 encKey, err := encryption.KeyFromEnv("ENC_KEY")
 if err != nil { return err }

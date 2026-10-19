@@ -62,7 +62,7 @@ import (
     "strings"
     "time"
 
-    "github.com/aocybersystems/eden-platform-go/platform/webhook"
+    "go.aocyber.ai/eden-platform-go/platform/webhook"
 )
 
 func receiveWebhook(w http.ResponseWriter, r *http.Request, secret string) {

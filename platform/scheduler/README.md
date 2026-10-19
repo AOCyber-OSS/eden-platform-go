@@ -16,7 +16,7 @@ new third-party dep) and supports the standard 5-field syntax plus
 ## Quickstart
 
 ```go
-import "github.com/aocybersystems/eden-platform-go/platform/scheduler"
+import "go.aocyber.ai/eden-platform-go/platform/scheduler"
 
 // Pick a locker:
 locker := scheduler.NewMemoryLocker()              // single-replica / dev

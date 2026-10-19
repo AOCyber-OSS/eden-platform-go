@@ -11,7 +11,7 @@ fallback for security-critical audits and tests.
 ## Quickstart
 
 ```go
-import "github.com/aocybersystems/eden-platform-go/platform/audit"
+import "go.aocyber.ai/eden-platform-go/platform/audit"
 
 logger := audit.NewLogger(store) // store implements audit.AuditStore
 logger.Start()

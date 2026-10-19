@@ -31,7 +31,7 @@ HTTP client today. When that service grows one, it should consume
 
 For every consumer:
 
-1. Add the dependency: `go get github.com/aocybersystems/eden-platform-go@<pinned-version>`
+1. Add the dependency: `go get go.aocyber.ai/eden-platform-go@<pinned-version>`
    (or rely on the existing `replace` directive if your repo already pins
    eden-platform-go via local path; see `eden-biz-go/go.mod` for an example).
 2. Replace your fork's import with `platform/aigateway`.

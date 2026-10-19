@@ -18,7 +18,7 @@ otherwise see `platform/webhook`), document import, AI tool calls.
 ## Quickstart
 
 ```go
-import "github.com/aocybersystems/eden-platform-go/platform/webfetch"
+import "go.aocyber.ai/eden-platform-go/platform/webfetch"
 
 c, _ := webfetch.NewClient(webfetch.SafeDefault())
 

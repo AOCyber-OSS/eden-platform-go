@@ -15,7 +15,7 @@ or `platform/attachments`.
 ## Quickstart
 
 ```go
-import "github.com/aocybersystems/eden-platform-go/platform/storage"
+import "go.aocyber.ai/eden-platform-go/platform/storage"
 
 policy := storage.Policy{
     MaxBytes:      50 * 1024 * 1024,                // 50 MB

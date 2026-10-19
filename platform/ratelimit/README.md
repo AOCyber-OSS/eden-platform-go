@@ -23,7 +23,7 @@ implementation.
 ## Quickstart
 
 ```go
-import "github.com/aocybersystems/eden-platform-go/platform/ratelimit"
+import "go.aocyber.ai/eden-platform-go/platform/ratelimit"
 
 // Single-instance / dev / tests
 limiter := ratelimit.NewMemory()

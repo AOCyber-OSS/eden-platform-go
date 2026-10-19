@@ -11,7 +11,7 @@ SMTP transport. Eden-Biz's email package is template-heavy; per the requirement,
 ## Quickstart
 
 ```go
-import "github.com/aocybersystems/eden-platform-go/platform/email"
+import "go.aocyber.ai/eden-platform-go/platform/email"
 
 // Production: SMTP transport
 sender := email.NewSMTP(email.SMTPConfig{

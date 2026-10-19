@@ -30,7 +30,7 @@ import (
     "log"
     "os"
 
-    "github.com/aocybersystems/eden-platform-go/platform/observability"
+    "go.aocyber.ai/eden-platform-go/platform/observability"
 )
 
 func main() {

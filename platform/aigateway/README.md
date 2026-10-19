@@ -15,7 +15,7 @@ changes will be flagged in `CHANGELOG.md` (per `eden-platform-go` policy).
 ## Quick start
 
 ```go
-import "github.com/aocybersystems/eden-platform-go/platform/aigateway"
+import "go.aocyber.ai/eden-platform-go/platform/aigateway"
 
 cfg, err := aigateway.ConfigFromEnv()
 if err != nil { /* AOSentry not configured — degrade gracefully */ }

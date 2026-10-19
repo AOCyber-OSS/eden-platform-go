@@ -7,6 +7,3 @@ lint:
 breaking:
   use:
     - FILE
-  # go_package moved to the vanity module path (AOCyber Objective 3); remove this exception once the adoption PR has merged (follow-up todo)
-  except:
-    - FILE_SAME_GO_PACKAGE

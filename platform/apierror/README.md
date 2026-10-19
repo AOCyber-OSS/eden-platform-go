@@ -44,8 +44,8 @@ from an LLM provider stays a 503 to the caller.
 
 ```go
 import (
-    "github.com/aocybersystems/eden-platform-go/platform/apierror"
-    "github.com/aocybersystems/eden-platform-go/platform/httputil"
+    "go.aocyber.ai/eden-platform-go/platform/apierror"
+    "go.aocyber.ai/eden-platform-go/platform/httputil"
 )
 
 func (h *Handler) GetThing(w http.ResponseWriter, r *http.Request) {

@@ -73,7 +73,7 @@ func (a *StripeAdapter) ParseWebhook(ctx context.Context, headers map[string]str
 ## Quickstart — consumer (Eden-Biz)
 
 ```go
-import billingrail "github.com/aocybersystems/eden-platform-go/platform/billing-rail"
+import billingrail "go.aocyber.ai/eden-platform-go/platform/billing-rail"
 
 type EdenBizSink struct { db *sql.DB }
 

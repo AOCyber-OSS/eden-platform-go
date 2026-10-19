@@ -5,7 +5,7 @@ Canonical environment configuration loader for the Eden portfolio. Beta.
 ## Quickstart
 
 ```go
-import "github.com/aocybersystems/eden-platform-go/platform/config"
+import "go.aocyber.ai/eden-platform-go/platform/config"
 
 cfg := config.Load()
 if err := cfg.Validate(); err != nil {

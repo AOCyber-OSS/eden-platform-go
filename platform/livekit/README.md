@@ -92,7 +92,7 @@ import (
     "log/slog"
     "net/http"
 
-    "github.com/aocybersystems/eden-platform-go/platform/livekit"
+    "go.aocyber.ai/eden-platform-go/platform/livekit"
 )
 
 func main() {

@@ -52,10 +52,10 @@ only way to clean the table (used by test cleanup; never in production).
 
 ```go
 import (
-    "github.com/aocybersystems/eden-platform-go/platform/audit"
-    "github.com/aocybersystems/eden-platform-go/platform/consent"
-    "github.com/aocybersystems/eden-platform-go/platform/household"
-    "github.com/aocybersystems/eden-platform-go/platform/pgstore"
+    "go.aocyber.ai/eden-platform-go/platform/audit"
+    "go.aocyber.ai/eden-platform-go/platform/consent"
+    "go.aocyber.ai/eden-platform-go/platform/household"
+    "go.aocyber.ai/eden-platform-go/platform/pgstore"
 )
 
 backend, _ := pgstore.NewBackend(ctx, dbURL, migrationsFS)

@@ -57,7 +57,7 @@ every other primitive lives here. AODex itself becomes a re-export shim in a
 follow-up workstream (`ws-aodex-auth-donor-shim`).
 
 If you're still calling `aodex-go/internal/auth.*` directly, switch to
-`github.com/aocybersystems/eden-platform-go/platform/auth` (or one of the
+`go.aocyber.ai/eden-platform-go/platform/auth` (or one of the
 sub-packages above) at your earliest convenience.
 
 ## Household-aware claims (Obj 24a)

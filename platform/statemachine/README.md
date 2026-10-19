@@ -11,7 +11,7 @@ to `platform/audit` or `platform/webhook`).
 ## Quickstart
 
 ```go
-import "github.com/aocybersystems/eden-platform-go/platform/statemachine"
+import "go.aocyber.ai/eden-platform-go/platform/statemachine"
 
 type State string
 type Event string

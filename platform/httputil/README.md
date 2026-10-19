@@ -41,8 +41,8 @@ types so the value can be passed straight into a generated query.
 
 ```go
 import (
-    "github.com/aocybersystems/eden-platform-go/platform/apierror"
-    "github.com/aocybersystems/eden-platform-go/platform/httputil"
+    "go.aocyber.ai/eden-platform-go/platform/apierror"
+    "go.aocyber.ai/eden-platform-go/platform/httputil"
 )
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {

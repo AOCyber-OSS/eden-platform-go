@@ -13,8 +13,8 @@ The metadata lives in Postgres; the blob lives in `platform/storage`.
 
 ```go
 import (
-    "github.com/aocybersystems/eden-platform-go/platform/attachments"
-    "github.com/aocybersystems/eden-platform-go/platform/storage"
+    "go.aocyber.ai/eden-platform-go/platform/attachments"
+    "go.aocyber.ai/eden-platform-go/platform/storage"
 )
 
 storeClient := storage.NewS3Client(s3Cfg, storage.Policy{MaxBytes: 25*1024*1024})

@@ -75,7 +75,7 @@ import (
     "net/http"
     "time"
 
-    "github.com/aocybersystems/eden-platform-go/platform/risk"
+    "go.aocyber.ai/eden-platform-go/platform/risk"
     "github.com/google/uuid"
 )
 

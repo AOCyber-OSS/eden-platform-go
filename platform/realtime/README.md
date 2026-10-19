@@ -21,7 +21,7 @@ provides the channel/subscriber/publisher contract that's portable across produc
 ## Quickstart
 
 ```go
-import "github.com/aocybersystems/eden-platform-go/platform/realtime"
+import "go.aocyber.ai/eden-platform-go/platform/realtime"
 
 // Single-instance
 hub := realtime.NewHub()

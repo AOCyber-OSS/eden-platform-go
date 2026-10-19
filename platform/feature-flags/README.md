@@ -29,7 +29,7 @@ if !ent.HasEntitlement(ctx, customer, "household_billing") {
 ## Quickstart
 
 ```go
-import featureflags "github.com/aocybersystems/eden-platform-go/platform/feature-flags"
+import featureflags "go.aocyber.ai/eden-platform-go/platform/feature-flags"
 
 src := featureflags.NewMemorySourceWithFlags(
     featureflags.Flag{Key: "new_dashboard", Enabled: true},

@@ -13,8 +13,8 @@ SAML 2.0 **Identity Provider** support. Together with `platform/auth/saml`
 
 ```go
 import (
-    "github.com/aocybersystems/eden-platform-go/platform/auth/saml"
-    "github.com/aocybersystems/eden-platform-go/platform/auth/saml/idp"
+    "go.aocyber.ai/eden-platform-go/platform/auth/saml"
+    "go.aocyber.ai/eden-platform-go/platform/auth/saml/idp"
 )
 
 // 1. Generate (or load) the IdP signing key.
