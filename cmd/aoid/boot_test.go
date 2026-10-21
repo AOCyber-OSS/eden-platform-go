@@ -55,7 +55,22 @@ func TestBootService_FullStack(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- srv.Start(ctx, ln) }()
+
+	// The test's own transport, so the cleanup can close every connection
+	// it holds before the server shuts down.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
 	t.Cleanup(func() {
+		// Close the client's connections first. The transport can dial a
+		// spare connection that never carries a request: a Body.Close before
+		// EOF returns its connection to the pool only after a background
+		// drain, so the next request finds no idle connection and dials one.
+		// The server sees the spare as StateNew, which http.Server.Shutdown
+		// treats as idle only once it is 5s old, so it outlives the 1s
+		// ShutdownTimeout and Shutdown returns context.DeadlineExceeded (a
+		// -race and load sensitive flake; runForTest in internal/aoid/server
+		// had the same one).
+		tr.CloseIdleConnections()
 		cancel()
 		select {
 		case err := <-done:
@@ -68,10 +83,27 @@ func TestBootService_FullStack(t *testing.T) {
 	})
 
 	base := "http://" + ln.Addr().String()
+	// get reads the body to EOF before closing it, so the connection is back
+	// in the pool before the next request starts (no spare dial).
+	get := func(t *testing.T, path string) (int, []byte) {
+		t.Helper()
+		r, err := client.Get(base + path)
+		if err != nil {
+			t.Fatalf("get %s: %v", path, err)
+		}
+		defer r.Body.Close()
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		return r.StatusCode, body
+	}
+
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		r, err := http.Get(base + "/readyz")
+		r, err := client.Get(base + "/readyz")
 		if err == nil {
+			_, _ = io.Copy(io.Discard, r.Body)
 			r.Body.Close()
 			if r.StatusCode == http.StatusOK {
 				break
@@ -84,13 +116,9 @@ func TestBootService_FullStack(t *testing.T) {
 	}
 
 	t.Run("discovery", func(t *testing.T) {
-		r, err := http.Get(base + "/.well-known/openid-configuration")
-		if err != nil {
-			t.Fatalf("get: %v", err)
-		}
-		defer r.Body.Close()
+		_, body := get(t, "/.well-known/openid-configuration")
 		var doc map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&doc); err != nil {
+		if err := json.Unmarshal(body, &doc); err != nil {
 			t.Fatalf("decode: %v", err)
 		}
 		if doc["service_status"] != "scaffold" {
@@ -102,15 +130,11 @@ func TestBootService_FullStack(t *testing.T) {
 	})
 
 	t.Run("jwks", func(t *testing.T) {
-		r, err := http.Get(base + "/.well-known/jwks.json")
-		if err != nil {
-			t.Fatalf("get: %v", err)
-		}
-		defer r.Body.Close()
+		_, body := get(t, "/.well-known/jwks.json")
 		var set struct {
 			Keys []map[string]any `json:"keys"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&set); err != nil {
+		if err := json.Unmarshal(body, &set); err != nil {
 			t.Fatalf("decode: %v", err)
 		}
 		if len(set.Keys) < 1 {
@@ -120,14 +144,9 @@ func TestBootService_FullStack(t *testing.T) {
 
 	t.Run("issuer_endpoints_503", func(t *testing.T) {
 		for _, p := range []string{"/oauth2/token", "/oauth2/authorize", "/oauth2/userinfo"} {
-			r, err := http.Get(base + p)
-			if err != nil {
-				t.Fatalf("get %s: %v", p, err)
-			}
-			body, _ := io.ReadAll(r.Body)
-			r.Body.Close()
-			if r.StatusCode != http.StatusServiceUnavailable {
-				t.Errorf("%s status=%d body=%s", p, r.StatusCode, body)
+			status, body := get(t, p)
+			if status != http.StatusServiceUnavailable {
+				t.Errorf("%s status=%d body=%s", p, status, body)
 			}
 		}
 	})
