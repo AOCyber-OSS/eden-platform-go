@@ -1,7 +1,9 @@
 package auth
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"strings"
 	"testing"
 	"time"
@@ -240,19 +242,25 @@ func TestHandoffTamperedSignatureIsRefused(t *testing.T) {
 		t.Fatalf("MintHandoff: %v", err)
 	}
 
-	// Flip the last byte of the signature segment.
+	// Flip one bit of the DECODED signature and re-encode it. Editing a
+	// character of the encoded segment is not enough: an HS256 signature is 32
+	// bytes, 43 base64url characters, and the last character carries 4 data
+	// bits and 2 padding bits that the non-strict decoder ignores, so a
+	// last-character edit decodes to the same signature 1 time in 16.
 	i := strings.LastIndex(code, ".")
 	if i < 0 || i == len(code)-1 {
 		t.Fatalf("unexpected handoff code shape: %q", code)
 	}
-	last := code[len(code)-1]
-	replacement := byte('A')
-	if last == 'A' {
-		replacement = 'B'
+	sig, err := base64.RawURLEncoding.DecodeString(code[i+1:])
+	if err != nil || len(sig) == 0 {
+		t.Fatalf("decode the signature segment: %v (%d bytes)", err, len(sig))
 	}
-	tampered := code[:len(code)-1] + string(replacement)
-	if tampered == code {
-		t.Fatal("tamper produced an identical code")
+	bad := bytes.Clone(sig)
+	bad[len(bad)/2] ^= 0x01
+	tampered := code[:i+1] + base64.RawURLEncoding.EncodeToString(bad)
+	got, err := base64.RawURLEncoding.DecodeString(tampered[i+1:])
+	if err != nil || bytes.Equal(got, sig) {
+		t.Fatalf("tamper did not change the decoded signature (err %v)", err)
 	}
 
 	resp, err := RedeemHandoff(t.Context(), jm, store, testHandoffAudience, tampered)
