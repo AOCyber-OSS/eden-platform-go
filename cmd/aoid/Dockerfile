@@ -11,7 +11,7 @@
 ############################
 # Stage 1: build
 ############################
-FROM golang:1.27.1-bookworm AS build
+FROM golang:1.27.3-bookworm AS build
 
 WORKDIR /src
 
