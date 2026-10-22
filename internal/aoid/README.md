@@ -30,11 +30,31 @@ go run ./cmd/aoid
 
 # Production / staging — Postgres-backed.
 export AOID_DATABASE_URL=postgres://aoid:secret@db:5432/aoid?sslmode=require
-export AOID_ISSUER=https://id.aocyber.ai
+export AOID_ISSUER=https://auth.aocyber.ai
 export AOID_JWT_KEY_SEED_PATHS="2026-Q2=/etc/aoid/q2.seed,2026-Q3=/etc/aoid/q3.seed"
 export AOID_JWT_ACTIVE_KID="2026-Q3"
 ./aoid
 ```
+
+> **The production issuer is `https://auth.aocyber.ai`.** Confirmed live: its
+> discovery document returns 200 and self-reports
+> `"issuer": "https://auth.aocyber.ai"`.
+>
+> This example previously read `https://id.aocyber.ai`, which **has no DNS at
+> all** — it was a placeholder that was never stood up. The same placeholder
+> reached production config elsewhere and broke real flows: AOID's
+> `portalBaseUrl` was unset and fell back to it, so every account-recovery email
+> linked to a host that does not resolve; the WebAuthn RPID was set to it, which
+> cannot be a registrable suffix of `auth.aocyber.ai`, so passkey registration
+> could never validate. Both are fixed in `opscluster-gitops`
+> (`charts/aoid/values.production.yaml`). Do not reintroduce the placeholder.
+>
+> Note that `auth.aocyber.ai` is served by the **standalone `aoid` deployment**
+> (its own repo; Helm chart at `opscluster-gitops/charts/aoid`), which exposes
+> `/oauth/*`. The co-located binary documented here exposes `/oauth2/*`. Point
+> `AOID_ISSUER` at a host this process actually serves — the issuer value is
+> emitted in discovery and baked into JWTs, so claiming a host you do not serve
+> produces tokens relying parties will reject.
 
 A graceful shutdown is triggered by SIGINT or SIGTERM; the server stops
 accepting new connections, in-flight requests have `AOID_SHUTDOWN_TIMEOUT`
