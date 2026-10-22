@@ -53,13 +53,28 @@ func buildSignedSAMLResponse(t *testing.T, email, displayName, authnContext stri
 	return base64.StdEncoding.EncodeToString(xmlBytes)
 }
 
-func TestExternalIdP_ValidateSAMLResponse(t *testing.T) {
+// The inbound SAML path refuses even a correctly signed assertion while
+// verification is unwired, and it says ErrInvalidConfig so the bridge
+// treats it as a misconfiguration rather than as a user's bad credential.
+//
+// This test replaces the former happy path, which asserted that a
+// response was accepted and its attributes returned. That test passed
+// with NO SigningCertificatePEM in the fixture, so what it actually
+// locked in was the authentication bypass: any assertion, signed by
+// anyone or by nobody, became an identity. See the doc comment on
+// ValidateSAMLResponse and aocyber-compliance#17.
+func TestExternalIdP_ValidateSAMLResponse_RefusesWhileVerificationIsUnwired(t *testing.T) {
 	cfg := newExternalIdPConfig(t, ProviderSAML, uuid.New())
 	cfg.AttributeMapping = map[string]string{
 		"email":        "email",
 		"display_name": "display_name",
 	}
-	idp, err := NewExternalIdP(cfg, nil)
+	// Non-empty is all the current code requires to get past the
+	// no-trust-anchor branch and reach the not-wired branch; it is not a
+	// usable certificate, and nothing verifies against it yet.
+	cfg.SigningCertificatePEM = "-----BEGIN CERTIFICATE-----\nnot-a-real-cert\n-----END CERTIFICATE-----"
+
+	idpInstance, err := NewExternalIdP(cfg, nil)
 	if err != nil {
 		t.Fatalf("NewExternalIdP: %v", err)
 	}
@@ -67,21 +82,12 @@ func TestExternalIdP_ValidateSAMLResponse(t *testing.T) {
 	encoded := buildSignedSAMLResponse(t, "alice@acme.com", "Alice Smith",
 		"urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport")
 
-	a, err := idp.ValidateSAMLResponse(context.Background(), encoded)
-	if err != nil {
-		t.Fatalf("ValidateSAMLResponse: %v", err)
+	a, err := idpInstance.ValidateSAMLResponse(context.Background(), encoded)
+	if err == nil {
+		t.Fatalf("accepted an assertion although no verifying path is wired: subject=%q", a.Subject)
 	}
-	if a.Email != "alice@acme.com" {
-		t.Errorf("Email: got %q", a.Email)
-	}
-	if a.DisplayName != "Alice Smith" {
-		t.Errorf("DisplayName: got %q", a.DisplayName)
-	}
-	if a.Domain() != "acme.com" {
-		t.Errorf("Domain: got %q", a.Domain())
-	}
-	if a.AuthnContext == "" {
-		t.Errorf("AuthnContext should be populated")
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("want ErrInvalidConfig so the bridge reports a config fault, got %v", err)
 	}
 }
 
@@ -245,5 +251,74 @@ func TestAssertion_HasMFA(t *testing.T) {
 		if got := a.HasMFA(); got != tc.mfa {
 			t.Errorf("HasMFA(%q): got %v, want %v", tc.ctx, got, tc.mfa)
 		}
+	}
+}
+
+// buildUnsignedSAMLResponse hand-writes a SAML Response carrying NO
+// signature at all, with attacker-chosen identity. Nothing issued it and
+// nothing signed it.
+func buildUnsignedSAMLResponse(email, displayName string) string {
+	raw := `<?xml version="1.0"?>
+<Response xmlns="urn:oasis:names:tc:SAML:2.0:protocol" ID="_forged" Version="2.0" IssueInstant="2026-10-14T00:00:00Z">
+  <Assertion xmlns="urn:oasis:names:tc:SAML:2.0:assertion" ID="_forged_a" Version="2.0" IssueInstant="2026-10-14T00:00:00Z">
+    <Issuer>https://attacker.example.com/idp</Issuer>
+    <Subject><NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress">` + email + `</NameID></Subject>
+    <Conditions NotBefore="2026-10-14T00:00:00Z" NotOnOrAfter="2099-01-01T00:00:00Z"/>
+    <AttributeStatement>
+      <Attribute Name="email"><AttributeValue>` + email + `</AttributeValue></Attribute>
+      <Attribute Name="display_name"><AttributeValue>` + displayName + `</AttributeValue></Attribute>
+    </AttributeStatement>
+    <AuthnStatement AuthnInstant="2026-10-14T00:00:00Z">
+      <AuthnContext><AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</AuthnContextClassRef></AuthnContext>
+    </AuthnStatement>
+  </Assertion>
+</Response>`
+	return base64.StdEncoding.EncodeToString([]byte(raw))
+}
+
+// A SAML response is a claim about who someone is, so an assertion that no
+// trusted IdP signed must never become an identity. This is the security
+// property of the whole federation inbound path, which is why it is
+// asserted on its own rather than folded into a happy-path test.
+func TestExternalIdP_ValidateSAMLResponse_RejectsUnsignedAssertion(t *testing.T) {
+	cfg := newExternalIdPConfig(t, ProviderSAML, uuid.New())
+	cfg.AttributeMapping = map[string]string{"email": "email", "display_name": "display_name"}
+	idpInstance, err := NewExternalIdP(cfg, nil)
+	if err != nil {
+		t.Fatalf("NewExternalIdP: %v", err)
+	}
+
+	forged := buildUnsignedSAMLResponse("attacker@evil.example", "Totally Legit")
+
+	a, err := idpInstance.ValidateSAMLResponse(context.Background(), forged)
+	if err == nil {
+		t.Fatalf("an unsigned assertion was accepted and became an identity: "+
+			"subject=%q email=%q (nothing signed this response)", a.Subject, a.Email)
+	}
+}
+
+// The doc comment on ValidateSAMLResponse promises that a registry entry
+// with no SigningCertificatePEM yields a CONFIG error rather than an
+// authentication success. Nothing can be verified without a trust anchor,
+// so the only safe answer is to refuse.
+func TestExternalIdP_ValidateSAMLResponse_RefusesWithoutASigningCertificate(t *testing.T) {
+	cfg := newExternalIdPConfig(t, ProviderSAML, uuid.New())
+	if cfg.SigningCertificatePEM != "" {
+		t.Fatalf("fixture precondition: expected no signing cert, got one")
+	}
+	idpInstance, err := NewExternalIdP(cfg, nil)
+	if err != nil {
+		t.Fatalf("NewExternalIdP: %v", err)
+	}
+
+	// Even a properly signed assertion must be refused when the registry
+	// entry names no certificate: with no trust anchor there is nothing to
+	// check the signature against.
+	encoded := buildSignedSAMLResponse(t, "alice@acme.com", "Alice Smith",
+		"urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport")
+
+	if _, err := idpInstance.ValidateSAMLResponse(context.Background(), encoded); err == nil {
+		t.Fatal("accepted an assertion although the registry entry configures no " +
+			"SigningCertificatePEM — there was no trust anchor to verify against")
 	}
 }

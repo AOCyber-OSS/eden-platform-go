@@ -40,3 +40,14 @@ Thumbs.db
 # and .planning/quick/ ARE committed; only the dotfiles are ignored.
 /.planning/.awareness-cache.json
 /.planning/.skill-active
+
+# Never commit developer key material. A real EC P-256 private key lived at
+# dev/jwt/jwt_es256_private.pem and reached the public Go module proxy, where
+# it cannot be withdrawn. Generate dev keys at runtime instead
+# (platform/auth/saml.GenerateSigningKey).
+#
+# Deliberately scoped to dev/ rather than a blanket *.pem: platform/mtls/piv
+# legitimately commits testdata certificates and a blanket rule would silently
+# refuse new fixtures there.
+dev/**/*.pem
+dev/**/*.key
