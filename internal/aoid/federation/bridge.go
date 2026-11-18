@@ -110,10 +110,22 @@ func (b *Bridge) HandleAssertion(ctx context.Context, tenantID, externalIdPID uu
 		return nil, err
 	}
 
-	user, isNew, err := Provision(ctx, b.AuthService, a.Email, a.DisplayName, cfg.JITPolicy)
+	user, isNew, err := Provision(ctx, b.AuthService, tenantID, a.Email, a.DisplayName, cfg.JITPolicy)
 	if err != nil {
 		b.logFailedLogin(tenantID, cfg, a, err)
 		return nil, err
+	}
+
+	// An existing member signs in with their own role in this tenant; only
+	// a freshly provisioned user gets the IdP's JIT default role.
+	roleName, roleLevel := jitRole(cfg.JITPolicy), jitRoleLevel(cfg.JITPolicy)
+	if !isNew {
+		role, err := b.AuthService.GetUserRole(ctx, tenantID, user.ID)
+		if err != nil {
+			b.logFailedLogin(tenantID, cfg, a, ErrFederationEmailNotMember)
+			return nil, ErrFederationEmailNotMember
+		}
+		roleName, roleLevel = role.Name, role.RoleLevel
 	}
 
 	// Mint tokens.
@@ -121,14 +133,18 @@ func (b *Bridge) HandleAssertion(ctx context.Context, tenantID, externalIdPID uu
 	access, err := b.JWT.CreateAccessToken(
 		user.ID.String(),
 		companyIDStr,
-		jitRole(cfg.JITPolicy),
-		jitRoleLevel(cfg.JITPolicy),
+		roleName,
+		roleLevel,
 		[]string{companyIDStr},
 	)
 	if err != nil {
 		return nil, fmt.Errorf("federation: mint access token: %w", err)
 	}
-	refresh, err := b.JWT.CreateRefreshToken(user.ID.String())
+	// Bound to the tenant (a refresh re-mints for it only, never the user's
+	// oldest company) and marked as a federation token: the flow knows no
+	// OAuth client, so the first client to redeem it at /oauth2/token binds
+	// it from then on (auth.Service.RefreshTokenForClient).
+	refresh, err := b.JWT.CreateClientCompanyRefreshToken(user.ID.String(), auth.FederationRefreshAudience, companyIDStr)
 	if err != nil {
 		return nil, fmt.Errorf("federation: mint refresh token: %w", err)
 	}

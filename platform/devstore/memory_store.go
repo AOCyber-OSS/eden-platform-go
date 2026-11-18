@@ -289,6 +289,19 @@ func (s *AuthStore) GetCompanyMembershipByUser(ctx context.Context, userID uuid.
 	return memberships[0], nil
 }
 
+// ListUserCompanyIDs implements auth.MembershipLister: the user's company
+// ids, oldest membership first.
+func (s *AuthStore) ListUserCompanyIDs(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
+	s.backend.mu.RLock()
+	defer s.backend.mu.RUnlock()
+	state := s.stateRef()
+	ids := make([]uuid.UUID, 0, len(state.memberships[userID]))
+	for _, m := range state.memberships[userID] {
+		ids = append(ids, m.CompanyID)
+	}
+	return ids, nil
+}
+
 func (s *AuthStore) GetRoleByID(ctx context.Context, roleID uuid.UUID) (auth.Role, error) {
 	s.backend.mu.RLock()
 	defer s.backend.mu.RUnlock()
@@ -333,6 +346,21 @@ func (s *AuthStore) GetRefreshToken(ctx context.Context, tokenHash string) (auth
 		return auth.RefreshTokenRecord{}, fmt.Errorf("refresh token not found")
 	}
 	return record, nil
+}
+
+// ConsumeRefreshToken implements auth.RefreshTokenConsumer: it removes an
+// active refresh token under the write lock, or reports
+// auth.ErrRefreshTokenNotActive.
+func (s *AuthStore) ConsumeRefreshToken(ctx context.Context, tokenHash string) error {
+	s.backend.mu.Lock()
+	defer s.backend.mu.Unlock()
+	state := s.stateRef()
+	record, ok := state.refreshTokens[tokenHash]
+	if !ok || time.Now().UTC().After(record.ExpiresAt) {
+		return auth.ErrRefreshTokenNotActive
+	}
+	delete(state.refreshTokens, tokenHash)
+	return nil
 }
 
 func (s *AuthStore) RevokeRefreshToken(ctx context.Context, tokenHash string) error {

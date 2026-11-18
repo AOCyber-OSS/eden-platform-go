@@ -9,6 +9,8 @@ type AuthMetrics struct {
 	loginsTotal        *prometheus.CounterVec
 	signupsTotal       *prometheus.CounterVec
 	tokenRefreshesTotal *prometheus.CounterVec
+
+	legacyUntypedTokensTotal *prometheus.CounterVec
 }
 
 // NewAuthMetrics creates auth-specific Prometheus counters and registers
@@ -36,11 +38,19 @@ func NewAuthMetrics(reg prometheus.Registerer) *AuthMetrics {
 			},
 			[]string{"result"},
 		),
+		legacyUntypedTokensTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "auth_legacy_untyped_tokens_total",
+				Help: "Pre-#80 tokens (no token_use) accepted in the migration window, by inferred token_use.",
+			},
+			[]string{"token_use"},
+		),
 	}
 
 	reg.MustRegister(m.loginsTotal)
 	reg.MustRegister(m.signupsTotal)
 	reg.MustRegister(m.tokenRefreshesTotal)
+	reg.MustRegister(m.legacyUntypedTokensTotal)
 
 	return m
 }
@@ -58,6 +68,12 @@ func (m *AuthMetrics) RecordSignup(success bool) {
 // RecordTokenRefresh increments the token refresh counter.
 func (m *AuthMetrics) RecordTokenRefresh(success bool) {
 	m.tokenRefreshesTotal.WithLabelValues(resultLabel(success)).Inc()
+}
+
+// RecordLegacyUntypedToken counts one legacy untyped token accepted by
+// platform/auth. Assign it to auth.JWTConfig.OnLegacyUntyped.
+func (m *AuthMetrics) RecordLegacyUntypedToken(inferredUse string) {
+	m.legacyUntypedTokensTotal.WithLabelValues(inferredUse).Inc()
 }
 
 func resultLabel(success bool) string {

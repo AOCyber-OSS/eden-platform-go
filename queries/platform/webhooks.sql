@@ -12,8 +12,9 @@ SELECT * FROM webhooks WHERE company_id = $1 ORDER BY created_at DESC;
 -- name: UpdateWebhookStatus :exec
 UPDATE webhooks SET active = $2, updated_at = now() WHERE id = $1;
 
--- name: DeleteWebhook :exec
-DELETE FROM webhooks WHERE id = $1;
+-- name: DeleteWebhook :execrows
+-- Tenant-scoped: a webhook id belonging to another company deletes nothing.
+DELETE FROM webhooks WHERE id = $1 AND company_id = $2;
 
 -- name: IncrementFailureCount :one
 UPDATE webhooks SET consecutive_fails = consecutive_fails + 1, updated_at = now()
@@ -40,10 +41,12 @@ ORDER BY created_at ASC
 LIMIT 100;
 
 -- name: ListDeliveriesByWebhook :many
+-- Tenant-scoped: only deliveries of a webhook owned by the given company.
 SELECT * FROM webhook_deliveries
 WHERE webhook_id = $1
+  AND webhook_id IN (SELECT id FROM webhooks WHERE company_id = $2)
 ORDER BY created_at DESC
-LIMIT $2 OFFSET $3;
+LIMIT $3 OFFSET $4;
 
 -- name: GetDelivery :one
 SELECT * FROM webhook_deliveries WHERE id = $1;

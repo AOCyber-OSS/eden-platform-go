@@ -69,13 +69,16 @@ c, _ := webfetch.NewClient(p)
   allow pattern, all other policy checks (private IP, deny patterns) are
   skipped. Only use AllowHosts for explicit integration tests or trusted
   internal services.
-- **Hostname resolution is part of policy enforcement.** `denyPrivateIP`
-  resolves the hostname and rejects any IP in a private range. This means
-  an attacker can't just send `http://attacker-controlled.example.com`
-  with a DNS A-record pointing to 169.254.169.254 — the resolved IP is
-  checked.
+- **The address policy is enforced on the connected address.** Hostnames
+  are resolved once by the shared `platform/netguard` dialer, every answer
+  is checked, and the socket connects to exactly those addresses (a
+  `Dialer.Control` hook re-checks the connected ip:port). There is no
+  separate pre-flight lookup, so a short-TTL name cannot pass the check
+  with a public answer and then connect to 127.0.0.1 or 169.254.169.254
+  (DNS rebinding). A lookup failure or empty answer is a policy violation
+  (fail closed). Set `Policy.Resolver` to supply your own resolver.
 - **Redirect-time policy is re-evaluated.** Each redirect re-checks
-  scheme + host. A 200 → 301 → file:// chain is blocked at hop 2, not at
+  scheme + host, and every new connection goes through the same dialer. A 200 → 301 → file:// chain is blocked at hop 2, not at
   hop 1.
 - **Truncated responses are flagged but not errored.** Callers see
   `res.Truncated == true`. If your context wants strict denial, wrap the

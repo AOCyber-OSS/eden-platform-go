@@ -73,8 +73,16 @@ func (s *WebhookStore) UpdateWebhookStatus(ctx context.Context, id uuid.UUID, ac
 	})
 }
 
-func (s *WebhookStore) DeleteWebhook(ctx context.Context, id uuid.UUID) error {
-	return s.queries().DeleteWebhook(ctx, id)
+// DeleteWebhook deletes the webhook only when it belongs to companyID.
+func (s *WebhookStore) DeleteWebhook(ctx context.Context, companyID, id uuid.UUID) error {
+	n, err := s.queries().DeleteWebhook(ctx, db.DeleteWebhookParams{ID: id, CompanyID: companyID})
+	if err != nil {
+		return fmt.Errorf("delete webhook: %w", err)
+	}
+	if n == 0 {
+		return webhook.ErrWebhookNotFound
+	}
+	return nil
 }
 
 func (s *WebhookStore) IncrementFailureCount(ctx context.Context, id uuid.UUID) (int, error) {
@@ -153,10 +161,12 @@ func (s *WebhookStore) ListFailedDeliveriesForRetry(ctx context.Context, maxAtte
 	return deliveries, nil
 }
 
-// ListDeliveriesByWebhook satisfies connectapi.deliveryQuerier.
-func (s *WebhookStore) ListDeliveriesByWebhook(ctx context.Context, webhookID uuid.UUID, limit, offset int) ([]webhook.WebhookDelivery, error) {
+// ListDeliveriesByWebhook satisfies connectapi.deliveryQuerier. Only
+// deliveries of a webhook owned by companyID are returned.
+func (s *WebhookStore) ListDeliveriesByWebhook(ctx context.Context, companyID, webhookID uuid.UUID, limit, offset int) ([]webhook.WebhookDelivery, error) {
 	rows, err := s.queries().ListDeliveriesByWebhook(ctx, db.ListDeliveriesByWebhookParams{
 		WebhookID: webhookID,
+		CompanyID: companyID,
 		Limit:     int32(limit),
 		Offset:    int32(offset),
 	})

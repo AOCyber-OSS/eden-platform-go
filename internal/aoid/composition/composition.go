@@ -190,5 +190,6 @@ func buildJWTManager(cfg *config.Config) (*auth.JWTManager, error) {
 	jwtCfg.KeySeedPath = cfg.JWTKeySeedPath
 	jwtCfg.KeySeedPaths = cfg.JWTKeySeedPaths
 	jwtCfg.ActiveKID = cfg.JWTActiveKID
+	jwtCfg.RejectLegacyUntyped = cfg.JWTRejectLegacyUntyped
 	return auth.NewJWTManager(jwtCfg)
 }

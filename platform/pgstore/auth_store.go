@@ -111,6 +111,11 @@ func (s *AuthStore) CreateCompanyMembership(ctx context.Context, companyID, user
 
 // -- Membership & role operations --
 
+// ListUserCompanyIDs implements auth.MembershipLister.
+func (s *AuthStore) ListUserCompanyIDs(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
+	return s.queries().ListUserCompanyIDs(ctx, userID)
+}
+
 func (s *AuthStore) GetCompanyMembershipByUser(ctx context.Context, userID uuid.UUID) (auth.Membership, error) {
 	// Get first company membership for this user
 	companyIDs, err := s.queries().ListUserCompanyIDs(ctx, userID)
@@ -198,6 +203,21 @@ func (s *AuthStore) GetRefreshToken(ctx context.Context, tokenHash string) (auth
 		TokenHash: row.TokenHash,
 		ExpiresAt: row.ExpiresAt,
 	}, nil
+}
+
+// ConsumeRefreshToken implements auth.RefreshTokenConsumer with a
+// conditional UPDATE (revoked = false, unexpired); zero rows affected is
+// auth.ErrRefreshTokenNotActive. Row locking makes concurrent consumers of
+// one token serialise, and only the first sees a row.
+func (s *AuthStore) ConsumeRefreshToken(ctx context.Context, tokenHash string) error {
+	n, err := s.queries().ConsumeRefreshToken(ctx, tokenHash)
+	if err != nil {
+		return fmt.Errorf("consume refresh token: %w", err)
+	}
+	if n == 0 {
+		return auth.ErrRefreshTokenNotActive
+	}
+	return nil
 }
 
 func (s *AuthStore) RevokeRefreshToken(ctx context.Context, tokenHash string) error {

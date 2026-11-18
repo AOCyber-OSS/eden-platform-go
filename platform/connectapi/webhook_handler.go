@@ -2,39 +2,75 @@ package connectapi
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	connect "connectrpc.com/connect"
 	platformv1 "go.aocyber.ai/eden-platform-go/gen/go/platform/v1"
 	platformv1connect "go.aocyber.ai/eden-platform-go/gen/go/platform/v1/platformv1connect"
-	"go.aocyber.ai/eden-platform-go/platform/webhook"
 	"github.com/google/uuid"
+	"go.aocyber.ai/eden-platform-go/platform/auth"
+	"go.aocyber.ai/eden-platform-go/platform/webhook"
 )
 
 var _ platformv1connect.WebhookServiceHandler = (*WebhookHandler)(nil)
 
-// deliveryQuerier provides paginated delivery listing beyond the base WebhookStore interface.
+// deliveryQuerier provides paginated delivery listing beyond the base
+// WebhookStore interface. Implementations MUST scope by companyID: only
+// deliveries of a webhook owned by that company are returned.
 type deliveryQuerier interface {
-	ListDeliveriesByWebhook(ctx context.Context, webhookID uuid.UUID, limit, offset int) ([]webhook.WebhookDelivery, error)
+	ListDeliveriesByWebhook(ctx context.Context, companyID, webhookID uuid.UUID, limit, offset int) ([]webhook.WebhookDelivery, error)
 }
 
-// WebhookHandler implements the WebhookService Connect handler.
+// WebhookHandler implements the WebhookService Connect handler. Every RPC is
+// scoped to the caller's company from the verified JWT claims; a request
+// body's company_id is only accepted when it matches.
 type WebhookHandler struct {
-	service          *webhook.Service
-	store            webhook.WebhookStore
-	deliveryQuerier  deliveryQuerier
+	service         *webhook.Service
+	store           webhook.WebhookStore
+	deliveryQuerier deliveryQuerier
 }
 
 // NewWebhookHandler creates a new webhook handler.
-// The querier parameter should be the concrete devstore.WebhookStore which implements deliveryQuerier.
+// The querier parameter should be the concrete devstore/pgstore WebhookStore, which implements deliveryQuerier.
 func NewWebhookHandler(service *webhook.Service, store webhook.WebhookStore, querier deliveryQuerier) *WebhookHandler {
 	return &WebhookHandler{service: service, store: store, deliveryQuerier: querier}
 }
 
-func (h *WebhookHandler) RegisterWebhook(ctx context.Context, req *connect.Request[platformv1.RegisterWebhookRequest]) (*connect.Response[platformv1.RegisterWebhookResponse], error) {
-	companyID, err := uuid.Parse(req.Msg.GetCompanyId())
+// errWebhookNotFound is the single answer for "no such webhook" and "a
+// webhook of another tenant": the two must be indistinguishable.
+var errWebhookNotFound = connect.NewError(connect.CodeNotFound, webhook.ErrWebhookNotFound)
+
+// callerCompany returns the caller's company from verified claims.
+func callerCompany(ctx context.Context) (uuid.UUID, error) {
+	id, err := auth.RequireCompany(ctx)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+		return uuid.Nil, connect.NewError(connect.CodeUnauthenticated, err)
+	}
+	return id, nil
+}
+
+// requestedCompany checks a request body's company_id against the caller.
+func requestedCompany(ctx context.Context, raw string) (uuid.UUID, error) {
+	caller, err := callerCompany(ctx)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	requested, err := uuid.Parse(raw)
+	if err != nil {
+		return uuid.Nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+	if requested != caller {
+		return uuid.Nil, connect.NewError(connect.CodePermissionDenied,
+			errors.New("webhook: company_id does not match the caller's company"))
+	}
+	return caller, nil
+}
+
+func (h *WebhookHandler) RegisterWebhook(ctx context.Context, req *connect.Request[platformv1.RegisterWebhookRequest]) (*connect.Response[platformv1.RegisterWebhookResponse], error) {
+	companyID, err := requestedCompany(ctx, req.Msg.GetCompanyId())
+	if err != nil {
+		return nil, err
 	}
 
 	wh, err := h.service.Register(ctx, companyID, req.Msg.GetUrl(), "", req.Msg.GetEvents())
@@ -46,9 +82,9 @@ func (h *WebhookHandler) RegisterWebhook(ctx context.Context, req *connect.Reque
 }
 
 func (h *WebhookHandler) ListWebhooks(ctx context.Context, req *connect.Request[platformv1.ListWebhooksRequest]) (*connect.Response[platformv1.ListWebhooksResponse], error) {
-	companyID, err := uuid.Parse(req.Msg.GetCompanyId())
+	companyID, err := requestedCompany(ctx, req.Msg.GetCompanyId())
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+		return nil, err
 	}
 
 	webhooks, err := h.store.ListWebhooksByCompany(ctx, companyID)
@@ -65,22 +101,40 @@ func (h *WebhookHandler) ListWebhooks(ctx context.Context, req *connect.Request[
 }
 
 func (h *WebhookHandler) DeleteWebhook(ctx context.Context, req *connect.Request[platformv1.DeleteWebhookRequest]) (*connect.Response[platformv1.DeleteWebhookResponse], error) {
+	companyID, err := callerCompany(ctx)
+	if err != nil {
+		return nil, err
+	}
 	id, err := uuid.Parse(req.Msg.GetId())
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
 
-	if err := h.store.DeleteWebhook(ctx, id); err != nil {
-		return nil, connect.NewError(connect.CodeNotFound, err)
+	if err := h.store.DeleteWebhook(ctx, companyID, id); err != nil {
+		if errors.Is(err, webhook.ErrWebhookNotFound) {
+			return nil, errWebhookNotFound
+		}
+		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 
 	return connect.NewResponse(&platformv1.DeleteWebhookResponse{}), nil
 }
 
 func (h *WebhookHandler) ListDeliveries(ctx context.Context, req *connect.Request[platformv1.ListDeliveriesRequest]) (*connect.Response[platformv1.ListDeliveriesResponse], error) {
+	companyID, err := callerCompany(ctx)
+	if err != nil {
+		return nil, err
+	}
 	webhookID, err := uuid.Parse(req.Msg.GetWebhookId())
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+
+	// Ownership first, so another tenant's id is NotFound rather than an
+	// empty list; the query below is scoped as well (defense in depth).
+	wh, err := h.store.GetWebhook(ctx, webhookID)
+	if err != nil || wh.CompanyID != companyID {
+		return nil, errWebhookNotFound
 	}
 
 	limit := int(req.Msg.GetLimit())
@@ -92,7 +146,7 @@ func (h *WebhookHandler) ListDeliveries(ctx context.Context, req *connect.Reques
 		offset = 0
 	}
 
-	deliveries, err := h.deliveryQuerier.ListDeliveriesByWebhook(ctx, webhookID, limit, offset)
+	deliveries, err := h.deliveryQuerier.ListDeliveriesByWebhook(ctx, companyID, webhookID, limit, offset)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}

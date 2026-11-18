@@ -9,6 +9,10 @@ WHERE token_hash = $1 AND revoked = false AND expires_at > now();
 -- name: RevokeRefreshToken :exec
 UPDATE refresh_tokens SET revoked = true WHERE token_hash = $1;
 
+-- name: ConsumeRefreshToken :execrows
+UPDATE refresh_tokens SET revoked = true
+WHERE token_hash = $1 AND revoked = false AND expires_at > now();
+
 -- name: RevokeAllUserTokens :exec
 UPDATE refresh_tokens SET revoked = true WHERE user_id = $1;
 

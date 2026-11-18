@@ -354,6 +354,9 @@ func TestJWTKeyRotation_MissingKID(t *testing.T) {
 			IssuedAt:  jwt.NewNumericDate(now),
 			ID:        generateJTI(),
 		},
+		// Typed (#80) so this test exercises only the missing-kid fallback,
+		// not the dated untyped-token window.
+		TokenUse:  TokenUseAccess,
 		UserID:    "user-legacy",
 		CompanyID: "company-1",
 		Role:      "admin",

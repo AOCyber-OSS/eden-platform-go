@@ -10,6 +10,7 @@ import (
 	"go.aocyber.ai/eden-platform-go/platform/audit"
 	"go.aocyber.ai/eden-platform-go/platform/auth"
 	"go.aocyber.ai/eden-platform-go/platform/devstore"
+	"go.aocyber.ai/eden-platform-go/platform/rbac"
 )
 
 func newTestBridge(t *testing.T) (*Bridge, *InMemorySPRegistry, *auth.Service, *audit.Logger) {
@@ -72,29 +73,21 @@ func TestBridge_HandleAssertion_NewUser(t *testing.T) {
 	}
 }
 
+// An existing MEMBER of the asserting tenant resolves without provisioning.
+// An email match on a non-member is refused (#74, jit_tenant_scope_test.go).
 func TestBridge_HandleAssertion_ExistingUser(t *testing.T) {
-	b, reg, svc, _ := newTestBridge(t)
-	ctx := context.Background()
-	tenantID := uuid.New()
-	cfg := newExternalIdPConfig(t, ProviderSAML, tenantID)
-	_ = reg.Register(ctx, cfg)
+	w := newFedWorld(t)
+	existing := w.member(w.A.ID, "existing@acme.com", rbac.MemberRoleID)
 
-	// Pre-create the user.
-	_, err := svc.CreateUser(ctx, "existing@acme.com", "$2a$10$dummybcrypthash...", "Existing")
-	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
-	}
-
-	a := &Assertion{
-		Email:        "existing@acme.com",
-		AuthnContext: "urn:oasis:names:tc:SAML:2.0:ac:classes:MultiFactorContract",
-	}
-	res, err := b.HandleAssertion(ctx, tenantID, cfg.ID, a)
+	res, err := w.loginVia(w.A, existing.Email)
 	if err != nil {
 		t.Fatalf("HandleAssertion: %v", err)
 	}
 	if res.ProvisionedNew {
 		t.Errorf("expected ProvisionedNew=false for existing user")
+	}
+	if res.User.ID != existing.ID {
+		t.Errorf("resolved %s, want %s", res.User.ID, existing.ID)
 	}
 }
 
@@ -205,7 +198,7 @@ func TestBridge_TokensValidate(t *testing.T) {
 
 func TestProvision_DirectInvalidEmail(t *testing.T) {
 	_, _, svc, _ := newTestBridge(t)
-	_, _, err := Provision(context.Background(), svc, "not-an-email", "", JITPolicy{Enabled: true})
+	_, _, err := Provision(context.Background(), svc, uuid.New(), "not-an-email", "", JITPolicy{Enabled: true})
 	if err == nil {
 		t.Errorf("expected invalid-email error")
 	}
@@ -213,7 +206,7 @@ func TestProvision_DirectInvalidEmail(t *testing.T) {
 
 func TestProvision_DirectMissingEmail(t *testing.T) {
 	_, _, svc, _ := newTestBridge(t)
-	_, _, err := Provision(context.Background(), svc, "", "", JITPolicy{Enabled: true})
+	_, _, err := Provision(context.Background(), svc, uuid.New(), "", "", JITPolicy{Enabled: true})
 	if !errors.Is(err, ErrInvalidConfig) {
 		t.Errorf("expected ErrInvalidConfig, got %v", err)
 	}

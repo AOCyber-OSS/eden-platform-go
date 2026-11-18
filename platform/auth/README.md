@@ -41,7 +41,7 @@ platform/auth/
 | Roll-your-own OIDC SP flow | `platform/auth/oidc` |
 | Roll-your-own SAML SP flow | `platform/auth/saml` |
 | SAML IdP issuance | `platform/auth/saml/idp` (added in obj 23) |
-| Userinfo from generic OAuth providers | `platform/auth/oauth` |
+| Social sign-in (verified provider ID tokens) | `platform/auth/social` |
 | Cookie sessions (web) | `platform/auth/session` |
 | API-key authentication (machine-to-machine) | `platform/auth/apikey` |
 | Passkey / WebAuthn ceremonies | `platform/auth/webauthn` |

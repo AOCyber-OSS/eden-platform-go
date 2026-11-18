@@ -89,7 +89,7 @@ func TestRBACAuditWebhook_Integration(t *testing.T) {
 	defer srv.Close()
 
 	store := newMemStore()
-	svc := webhook.NewService(store)
+	svc := webhook.NewService(store, localReceiver)
 
 	wh, err := svc.Register(ctx, companyID, srv.URL, "shared-secret", []string{"rbac.*"})
 	if err != nil {
@@ -171,7 +171,7 @@ func TestRBACAuditWebhook_Integration_NonMatchingEvent(t *testing.T) {
 	defer srv.Close()
 
 	store := newMemStore()
-	svc := webhook.NewService(store)
+	svc := webhook.NewService(store, localReceiver)
 	companyID := uuid.New()
 	if _, err := svc.Register(ctx, companyID, srv.URL, "secret", []string{"spend.*"}); err != nil {
 		t.Fatalf("Register: %v", err)

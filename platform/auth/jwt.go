@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
@@ -28,6 +29,14 @@ import (
 // consumer. Populate them only via JWTManager.CreateHouseholdAccessToken.
 type Claims struct {
 	jwt.RegisteredClaims
+
+	// TokenUse is the token-type claim (issue #80): "access" on every token
+	// from CreateAccessToken / CreateAccessTokenWithScopes /
+	// CreateHouseholdAccessToken. ValidateAccessToken requires it, so a
+	// refresh, state or ID token signed with the same key is not an access
+	// token.
+	TokenUse string `json:"token_use,omitempty"`
+
 	UserID     string   `json:"uid"`
 	CompanyID  string   `json:"cid"`
 	CompanyIDs []string `json:"cids,omitempty"`
@@ -93,6 +102,64 @@ func (c *Claims) OnlyHasScope(scope string) bool {
 	return len(c.Scopes) == 1 && c.Scopes[0] == scope
 }
 
+// Token-use claim values (issue #80). Every token this package mints carries
+// exactly one of them in the "token_use" claim, and each Validate* method
+// accepts only its own. All ML-DSA-65 tokens share one signing key, so without
+// this claim the signature alone cannot tell an access token from a refresh,
+// state or ID token.
+const (
+	TokenUseAccess     = "access"
+	TokenUseRefresh    = "refresh"
+	TokenUseShortLived = "short_lived"
+	// TokenUseID marks an OIDC ID token minted by the AO ID issuer with this
+	// package's key. No JWTManager validator accepts it.
+	TokenUseID = "id"
+)
+
+// RefreshClaims are the claims of a refresh token. Audience, when set, is the
+// OAuth client the refresh token was issued to (see CreateClientRefreshToken).
+// CompanyID, when set, is the company the session was issued for (see
+// CreateCompanyRefreshToken); a refresh re-mints for that company only.
+type RefreshClaims struct {
+	jwt.RegisteredClaims
+	TokenUse  string `json:"token_use,omitempty"`
+	CompanyID string `json:"cid,omitempty"`
+}
+
+// typedClaims is the parse target for refresh and short-lived tokens. UID is
+// never minted on these types; it is read only so legacyUseOf can tell a
+// pre-#80 access token apart.
+type typedClaims struct {
+	jwt.RegisteredClaims
+	TokenUse  string `json:"token_use,omitempty"`
+	UID       string `json:"uid,omitempty"`
+	CompanyID string `json:"cid,omitempty"`
+}
+
+// legacyShortLivedMax is the longest lifetime a pre-#80 untyped token can have
+// and still be classified as short-lived (state tokens were minted for 10
+// minutes); anything longer is classified as a refresh token (7 days).
+const legacyShortLivedMax = time.Hour
+
+// legacyUseOf classifies a token minted before #80 (no token_use) by the only
+// shapes the previous release produced:
+//   - uid present                -> access (only access tokens carried uid)
+//   - aud present                -> none (AO ID ID tokens; never accepted)
+//   - lifetime > 1h              -> refresh
+//   - lifetime <= 1h             -> short_lived
+func legacyUseOf(c *typedClaims) string {
+	if c.UID != "" {
+		return TokenUseAccess
+	}
+	if len(c.Audience) > 0 || c.ExpiresAt == nil || c.IssuedAt == nil {
+		return ""
+	}
+	if c.ExpiresAt.Sub(c.IssuedAt.Time) > legacyShortLivedMax {
+		return TokenUseRefresh
+	}
+	return TokenUseShortLived
+}
+
 // KeyEntry holds an ML-DSA-65 key pair identified by a kid (Key ID).
 type KeyEntry struct {
 	PrivateKey *mldsa65.PrivateKey
@@ -118,7 +185,36 @@ type JWTConfig struct {
 	Issuer             string
 	AccessTokenExpiry  time.Duration
 	RefreshTokenExpiry time.Duration
+
+	// LegacyUntypedCutoff ends the migration window for tokens minted before
+	// the token_use claim existed (issue #80). Until this instant, a token
+	// with NO token_use is accepted by the validator its claim shape belongs
+	// to (see legacyUseOf); from it on, every untyped token is rejected.
+	// Zero means DefaultLegacyUntypedCutoff.
+	LegacyUntypedCutoff time.Time
+
+	// RejectLegacyUntyped closes the migration window now, regardless of
+	// LegacyUntypedCutoff. Consumers can drive it (and the cutoff) from their
+	// env with ApplyLegacyUntypedEnv.
+	RejectLegacyUntyped bool
+
+	// OnLegacyUntyped, when set, is called once per legacy (untyped) token
+	// accepted in the window, with its inferred token_use. Wire it to a
+	// metric (observability.AuthMetrics.RecordLegacyUntypedToken) to see
+	// when pre-#80 tokens stop arriving.
+	OnLegacyUntyped func(inferredUse string)
+
+	// Logger receives the rate-limited legacy-acceptance warning (one per
+	// inferred type per minute). Nil means slog.Default().
+	Logger *slog.Logger
 }
+
+// DefaultLegacyUntypedCutoff is the end of the #80 migration window. Access
+// tokens live 15 minutes and state tokens 10, so only refresh tokens (7 days,
+// rotated on use) need the window; it is set a few weeks out so a module bump
+// that ships late still lets pre-#80 sessions rotate onto typed tokens. After
+// it the legacy path is dead code and should be deleted.
+var DefaultLegacyUntypedCutoff = time.Date(2026, time.December, 15, 0, 0, 0, 0, time.UTC)
 
 // DefaultJWTConfig returns sensible defaults.
 func DefaultJWTConfig() JWTConfig {
@@ -136,6 +232,40 @@ type JWTManager struct {
 	keys      map[string]*KeyEntry // kid -> key pair
 	activeKID string               // kid used for signing new tokens
 	config    JWTConfig
+	now       func() time.Time // clock for the legacy window; time.Now outside tests
+
+	legacyLogMu    sync.Mutex
+	legacyLoggedAt map[string]time.Time // inferred use -> last warning
+}
+
+// legacyLogInterval rate-limits the legacy-acceptance warning per type.
+const legacyLogInterval = time.Minute
+
+// noteLegacy reports one accepted legacy token: the hook every time, the log
+// at most once per type per legacyLogInterval.
+func (m *JWTManager) noteLegacy(use string) {
+	if m.config.OnLegacyUntyped != nil {
+		m.config.OnLegacyUntyped(use)
+	}
+	now := m.now()
+	m.legacyLogMu.Lock()
+	last, seen := m.legacyLoggedAt[use]
+	due := !seen || now.Sub(last) >= legacyLogInterval
+	if due {
+		if m.legacyLoggedAt == nil {
+			m.legacyLoggedAt = make(map[string]time.Time)
+		}
+		m.legacyLoggedAt[use] = now
+	}
+	m.legacyLogMu.Unlock()
+	if due {
+		logger := m.config.Logger
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.Warn("legacy untyped token accepted (issue #80 migration window)",
+			"inferred_token_use", use, "cutoff", m.config.LegacyUntypedCutoff)
+	}
 }
 
 // NewJWTManager creates a JWTManager from key seed files or auto-generates for dev.
@@ -154,10 +284,14 @@ func NewJWTManager(cfg JWTConfig) (*JWTManager, error) {
 	if cfg.RefreshTokenExpiry == 0 {
 		cfg.RefreshTokenExpiry = 7 * 24 * time.Hour
 	}
+	if cfg.LegacyUntypedCutoff.IsZero() {
+		cfg.LegacyUntypedCutoff = DefaultLegacyUntypedCutoff
+	}
 
 	m := &JWTManager{
 		keys:   make(map[string]*KeyEntry),
 		config: cfg,
+		now:    time.Now,
 	}
 
 	// Multi-key mode: KeySeedPaths takes priority.
@@ -243,6 +377,7 @@ func (m *JWTManager) CreateAccessTokenWithScopes(
 			IssuedAt:  jwt.NewNumericDate(now),
 			ID:        generateJTI(),
 		},
+		TokenUse:   TokenUseAccess,
 		UserID:     userID,
 		CompanyID:  companyID,
 		CompanyIDs: companyIDs,
@@ -287,6 +422,7 @@ func (m *JWTManager) CreateHouseholdAccessToken(userID, householdID, childID str
 			IssuedAt:  jwt.NewNumericDate(now),
 			ID:        generateJTI(),
 		},
+		TokenUse:    TokenUseAccess,
 		UserID:      userID,
 		HouseholdID: householdID,
 		ChildID:     childID,
@@ -297,22 +433,67 @@ func (m *JWTManager) CreateHouseholdAccessToken(userID, householdID, childID str
 	return token.SignedString(m.keys[m.activeKID].PrivateKey)
 }
 
-// CreateRefreshToken creates a signed ML-DSA-65 refresh token with a kid header.
+// CreateRefreshToken creates a signed ML-DSA-65 refresh token with a kid
+// header and token_use "refresh". It is bound to no company and no OAuth
+// client, so Service.RefreshToken re-mints a company-less access token from
+// it. Use CreateCompanyRefreshToken for a company-scoped session and
+// CreateClientRefreshToken for tokens handed to an OAuth client.
 func (m *JWTManager) CreateRefreshToken(userID string) (string, error) {
+	return m.createRefreshToken(userID, "", "")
+}
+
+// CreateCompanyRefreshToken creates a refresh token bound to the company the
+// session was issued for (cid claim). A refresh re-mints for that company
+// only, with the role the user holds there at refresh time.
+func (m *JWTManager) CreateCompanyRefreshToken(userID, companyID string) (string, error) {
+	if companyID == "" {
+		return "", fmt.Errorf("create company refresh token: empty company id")
+	}
+	return m.createRefreshToken(userID, "", companyID)
+}
+
+// CreateClientRefreshToken creates a refresh token bound to an OAuth client:
+// its aud claim is clientID. Refresh grants must check the binding (see
+// Service.RefreshTokenForClient).
+func (m *JWTManager) CreateClientRefreshToken(userID, clientID string) (string, error) {
+	if clientID == "" {
+		return "", fmt.Errorf("create client refresh token: empty client id")
+	}
+	return m.createRefreshToken(userID, clientID, "")
+}
+
+// CreateClientCompanyRefreshToken is CreateClientRefreshToken that also binds
+// the company (used when rotating a client-bound, company-bound token).
+func (m *JWTManager) CreateClientCompanyRefreshToken(userID, clientID, companyID string) (string, error) {
+	if clientID == "" {
+		return "", fmt.Errorf("create client refresh token: empty client id")
+	}
+	return m.createRefreshToken(userID, clientID, companyID)
+}
+
+func (m *JWTManager) createRefreshToken(userID, clientID, companyID string) (string, error) {
 	now := time.Now()
-	claims := &jwt.RegisteredClaims{
-		Subject:   userID,
-		Issuer:    m.config.Issuer,
-		ExpiresAt: jwt.NewNumericDate(now.Add(m.config.RefreshTokenExpiry)),
-		IssuedAt:  jwt.NewNumericDate(now),
-		ID:        generateJTI(),
+	claims := &typedClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   userID,
+			Issuer:    m.config.Issuer,
+			ExpiresAt: jwt.NewNumericDate(now.Add(m.config.RefreshTokenExpiry)),
+			IssuedAt:  jwt.NewNumericDate(now),
+			ID:        generateJTI(),
+		},
+		TokenUse:  TokenUseRefresh,
+		CompanyID: companyID,
+	}
+	if clientID != "" {
+		claims.Audience = jwt.ClaimStrings{clientID}
 	}
 	token := jwt.NewWithClaims(signingMethodMLDSA65, claims)
 	token.Header["kid"] = m.activeKID
 	return token.SignedString(m.keys[m.activeKID].PrivateKey)
 }
 
-// ValidateAccessToken parses and validates an access token, returning the claims.
+// ValidateAccessToken parses and validates an access token, returning the
+// claims. The token must carry token_use "access".
 func (m *JWTManager) ValidateAccessToken(tokenStr string) (*Claims, error) {
 	claims := &Claims{}
 	token, err := jwt.ParseWithClaims(tokenStr, claims, m.keyfunc)
@@ -322,47 +503,97 @@ func (m *JWTManager) ValidateAccessToken(tokenStr string) (*Claims, error) {
 	if !token.Valid {
 		return nil, fmt.Errorf("invalid access token")
 	}
+	use := claims.TokenUse
+	if use == "" && m.legacyWindowOpen() && claims.UserID != "" && len(claims.Audience) == 0 {
+		// Pre-#80 access token: only access tokens ever carried uid.
+		use = TokenUseAccess
+	}
+	if use != TokenUseAccess {
+		return nil, fmt.Errorf("invalid access token: token_use %q", claims.TokenUse)
+	}
+	if claims.TokenUse == "" {
+		m.noteLegacy(TokenUseAccess)
+	}
 	return claims, nil
 }
 
-// ValidateRefreshToken parses and validates a refresh token.
+// ValidateRefreshToken parses and validates a refresh token. The token must
+// carry token_use "refresh". Callers that need the client binding use
+// ValidateRefreshTokenClaims.
 func (m *JWTManager) ValidateRefreshToken(tokenStr string) (*jwt.RegisteredClaims, error) {
-	claims := &jwt.RegisteredClaims{}
-	token, err := jwt.ParseWithClaims(tokenStr, claims, m.keyfunc)
+	c, err := m.ValidateRefreshTokenClaims(tokenStr)
+	if err != nil {
+		return nil, err
+	}
+	return &c.RegisteredClaims, nil
+}
+
+// ValidateRefreshTokenClaims is ValidateRefreshToken returning the full
+// refresh claims, including the token_use and the client binding (aud).
+func (m *JWTManager) ValidateRefreshTokenClaims(tokenStr string) (*RefreshClaims, error) {
+	claims, err := m.parseTyped(tokenStr, TokenUseRefresh)
 	if err != nil {
 		return nil, fmt.Errorf("parse refresh token: %w", err)
 	}
+	return &RefreshClaims{RegisteredClaims: claims.RegisteredClaims, TokenUse: claims.TokenUse, CompanyID: claims.CompanyID}, nil
+}
+
+// legacyWindowOpen reports whether tokens without a token_use claim may still
+// be classified by shape (the #80 migration window).
+func (m *JWTManager) legacyWindowOpen() bool {
+	return !m.config.RejectLegacyUntyped && m.now().Before(m.config.LegacyUntypedCutoff)
+}
+
+// parseTyped parses an ML-DSA-65 token into typedClaims and requires the
+// given token_use.
+func (m *JWTManager) parseTyped(tokenStr, use string) (*typedClaims, error) {
+	claims := &typedClaims{}
+	token, err := jwt.ParseWithClaims(tokenStr, claims, m.keyfunc)
+	if err != nil {
+		return nil, err
+	}
 	if !token.Valid {
-		return nil, fmt.Errorf("invalid refresh token")
+		return nil, fmt.Errorf("invalid token")
+	}
+	got := claims.TokenUse
+	if got == "" && m.legacyWindowOpen() {
+		got = legacyUseOf(claims)
+	}
+	if got != use {
+		return nil, fmt.Errorf("token_use %q, want %q", claims.TokenUse, use)
+	}
+	if claims.TokenUse == "" {
+		m.noteLegacy(use)
 	}
 	return claims, nil
 }
 
-// CreateShortLivedToken creates a signed JWT with the given subject and expiry.
-// Used for SSO state parameters, email verification, etc.
+// CreateShortLivedToken creates a signed JWT with the given subject and expiry
+// and token_use "short_lived". Used for SSO state parameters, email
+// verification, etc.
 func (m *JWTManager) CreateShortLivedToken(subject string, expiry time.Duration) (string, error) {
 	now := time.Now()
-	claims := &jwt.RegisteredClaims{
-		Subject:   subject,
-		Issuer:    m.config.Issuer,
-		ExpiresAt: jwt.NewNumericDate(now.Add(expiry)),
-		IssuedAt:  jwt.NewNumericDate(now),
-		ID:        generateJTI(),
+	claims := &typedClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   subject,
+			Issuer:    m.config.Issuer,
+			ExpiresAt: jwt.NewNumericDate(now.Add(expiry)),
+			IssuedAt:  jwt.NewNumericDate(now),
+			ID:        generateJTI(),
+		},
+		TokenUse: TokenUseShortLived,
 	}
 	token := jwt.NewWithClaims(signingMethodMLDSA65, claims)
 	token.Header["kid"] = m.activeKID
 	return token.SignedString(m.keys[m.activeKID].PrivateKey)
 }
 
-// ValidateShortLivedToken parses and validates a short-lived token, returning the subject.
+// ValidateShortLivedToken parses and validates a short-lived token, returning
+// the subject. The token must carry token_use "short_lived".
 func (m *JWTManager) ValidateShortLivedToken(tokenStr string) (string, error) {
-	claims := &jwt.RegisteredClaims{}
-	token, err := jwt.ParseWithClaims(tokenStr, claims, m.keyfunc)
+	claims, err := m.parseTyped(tokenStr, TokenUseShortLived)
 	if err != nil {
 		return "", fmt.Errorf("parse short-lived token: %w", err)
-	}
-	if !token.Valid {
-		return "", fmt.Errorf("invalid token")
 	}
 	return claims.Subject, nil
 }
@@ -400,12 +631,15 @@ func (m *JWTManager) CreateCompactShortLivedToken(subject string, expiry time.Du
 		return "", err
 	}
 	now := time.Now()
-	claims := &jwt.RegisteredClaims{
-		Subject:   subject,
-		Issuer:    m.config.Issuer,
-		ExpiresAt: jwt.NewNumericDate(now.Add(expiry)),
-		IssuedAt:  jwt.NewNumericDate(now),
-		ID:        generateJTI(),
+	claims := &typedClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   subject,
+			Issuer:    m.config.Issuer,
+			ExpiresAt: jwt.NewNumericDate(now.Add(expiry)),
+			IssuedAt:  jwt.NewNumericDate(now),
+			ID:        generateJTI(),
+		},
+		TokenUse: TokenUseShortLived,
 	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(key)
 }
@@ -418,7 +652,7 @@ func (m *JWTManager) ValidateCompactShortLivedToken(tokenStr string) (string, er
 	if err != nil {
 		return "", err
 	}
-	claims := &jwt.RegisteredClaims{}
+	claims := &typedClaims{}
 	token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
 		if t.Method.Alg() != jwt.SigningMethodHS256.Alg() {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
@@ -430,6 +664,15 @@ func (m *JWTManager) ValidateCompactShortLivedToken(tokenStr string) (string, er
 	}
 	if !token.Valid {
 		return "", fmt.Errorf("invalid token")
+	}
+	// The HMAC key is used only for these tokens, so the key already separates
+	// them from every ML-DSA-65 type; the claim keeps the rule uniform. An
+	// untyped compact token is pre-#80 and accepted only in the window.
+	if claims.TokenUse != TokenUseShortLived && !(claims.TokenUse == "" && m.legacyWindowOpen()) {
+		return "", fmt.Errorf("invalid token: token_use %q", claims.TokenUse)
+	}
+	if claims.TokenUse == "" {
+		m.noteLegacy("compact_" + TokenUseShortLived)
 	}
 	return claims.Subject, nil
 }

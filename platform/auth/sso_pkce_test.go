@@ -243,6 +243,7 @@ func newSSOTestService(t *testing.T, op *fakePKCEOP, clientID string) (*auth.SSO
 	}
 
 	svc := auth.NewSSOService(store, jwtManager, "https://api.aocyber.ai")
+	allowLoopbackIdPForTest(svc)
 	return svc, companyID
 }
 
@@ -407,4 +408,11 @@ func TestSSO_PKCE(t *testing.T) {
 			t.Errorf("legacy path posted a code_verifier %q, want none", op.postedVerifier())
 		}
 	})
+}
+
+// allowLoopbackIdPForTest lets an SSOService reach the plain-http loopback
+// fake OPs these tests run. The production egress policy (#85) refuses
+// loopback and http; see sso_egress_test.go for that policy's own tests.
+func allowLoopbackIdPForTest(svc *auth.SSOService) {
+	svc.SetEgressForTest(func(h string) bool { return h == "127.0.0.1" }, true, nil, nil)
 }

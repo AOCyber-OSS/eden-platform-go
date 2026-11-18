@@ -85,7 +85,8 @@ func parseECPrivateKey(pemStr string) (*ecdsa.PrivateKey, error) {
 // verifyAppleIDToken verifies an Apple id_token against Apple's JWKS via go-oidc
 // discovery and returns its claims. The audience is the Services ID (Apple's
 // client_id). This is the SECURE path — signature + issuer + audience + expiry
-// are all checked, unlike the insecure oauth/oauth.go decoder.
+// are all checked, unlike the unverified decoder that platform/auth/oauth had
+// (removed for issue #75).
 func verifyAppleIDToken(ctx context.Context, rawIDToken, servicesID string) (map[string]any, error) {
 	provider, err := gooidc.NewProvider(ctx, appleIssuer)
 	if err != nil {

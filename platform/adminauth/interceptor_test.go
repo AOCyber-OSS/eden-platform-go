@@ -212,3 +212,49 @@ func TestInterceptor_SuperAdminHasTenantAccessForAnyTarget(t *testing.T) {
 	require.True(t, got.HasTenantAccess(uuid.Nil))
 	require.True(t, got.HasTenantAccess(uuid.MustParse("22222222-2222-2222-2222-222222222222")))
 }
+
+// fakeStreamConn is a minimal connect.StreamingHandlerConn; the interceptor
+// under test only reads the context, never the conn.
+type fakeStreamConn struct{ connect.StreamingHandlerConn }
+
+func runStreaming(t *testing.T, ctx context.Context, r adminauth.AdminIdentityResolver) (called bool, seen *adminauth.AdminIdentity, err error) {
+	t.Helper()
+	icpt := adminauth.NewAdminContextInterceptor(r)
+	handler := icpt.WrapStreamingHandler(func(ctx context.Context, _ connect.StreamingHandlerConn) error {
+		called = true
+		seen = adminauth.AdminIdentityFromContext(ctx)
+		return nil
+	})
+	err = handler(ctx, fakeStreamConn{})
+	return called, seen, err
+}
+
+// Streaming companion to #78: without this, every admin stream reaches the
+// tenant-scope check with no identity (now: Unauthenticated), and before
+// #78 reached the handler with no admin check at all.
+func TestInterceptor_Streaming_HappyPathPopulatesAdminIdentity(t *testing.T) {
+	tenant := uuid.New()
+	r := &fakeResolver{knownCN: "aoid-admin-acme", identity: adminauth.AdminIdentity{SubjectCN: "aoid-admin-acme", TenantID: tenant}}
+	called, seen, err := runStreaming(t, ctxWithTLSState(t, makeTLSStateWithCN("aoid-admin-acme")), r)
+	require.NoError(t, err)
+	require.True(t, called)
+	require.NotNil(t, seen, "streaming handler must see the AdminIdentity")
+	require.Equal(t, tenant, seen.TenantID)
+}
+
+func TestInterceptor_Streaming_UnknownAdminIsPermissionDenied(t *testing.T) {
+	r := &fakeResolver{knownCN: "aoid-admin-acme"}
+	called, _, err := runStreaming(t, ctxWithTLSState(t, makeTLSStateWithCN("aoid-admin-evil")), r)
+	require.False(t, called)
+	var ce *connect.Error
+	require.True(t, errors.As(err, &ce))
+	require.Equal(t, connect.CodePermissionDenied, ce.Code())
+}
+
+func TestInterceptor_Streaming_MissingTLSStateIsInternal(t *testing.T) {
+	called, _, err := runStreaming(t, context.Background(), &fakeResolver{knownCN: "x"})
+	require.False(t, called)
+	var ce *connect.Error
+	require.True(t, errors.As(err, &ce))
+	require.Equal(t, connect.CodeInternal, ce.Code())
+}

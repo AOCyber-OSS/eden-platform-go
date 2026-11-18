@@ -77,13 +77,22 @@ func (q *Queries) CreateWebhook(ctx context.Context, arg CreateWebhookParams) (W
 	return i, err
 }
 
-const deleteWebhook = `-- name: DeleteWebhook :exec
-DELETE FROM webhooks WHERE id = $1
+const deleteWebhook = `-- name: DeleteWebhook :execrows
+DELETE FROM webhooks WHERE id = $1 AND company_id = $2
 `
 
-func (q *Queries) DeleteWebhook(ctx context.Context, id uuid.UUID) error {
-	_, err := q.db.Exec(ctx, deleteWebhook, id)
-	return err
+type DeleteWebhookParams struct {
+	ID        uuid.UUID `json:"id"`
+	CompanyID uuid.UUID `json:"company_id"`
+}
+
+// Tenant-scoped: a webhook id belonging to another company deletes nothing.
+func (q *Queries) DeleteWebhook(ctx context.Context, arg DeleteWebhookParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteWebhook, arg.ID, arg.CompanyID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getDelivery = `-- name: GetDelivery :one
@@ -183,18 +192,26 @@ func (q *Queries) IncrementFailureCount(ctx context.Context, id uuid.UUID) (int3
 const listDeliveriesByWebhook = `-- name: ListDeliveriesByWebhook :many
 SELECT id, webhook_id, event_type, payload, status, status_code, response_body, attempts, next_retry_at, created_at FROM webhook_deliveries
 WHERE webhook_id = $1
+  AND webhook_id IN (SELECT id FROM webhooks WHERE company_id = $2)
 ORDER BY created_at DESC
-LIMIT $2 OFFSET $3
+LIMIT $3 OFFSET $4
 `
 
 type ListDeliveriesByWebhookParams struct {
 	WebhookID uuid.UUID `json:"webhook_id"`
+	CompanyID uuid.UUID `json:"company_id"`
 	Limit     int32     `json:"limit"`
 	Offset    int32     `json:"offset"`
 }
 
+// Tenant-scoped: only deliveries of a webhook owned by the given company.
 func (q *Queries) ListDeliveriesByWebhook(ctx context.Context, arg ListDeliveriesByWebhookParams) ([]WebhookDelivery, error) {
-	rows, err := q.db.Query(ctx, listDeliveriesByWebhook, arg.WebhookID, arg.Limit, arg.Offset)
+	rows, err := q.db.Query(ctx, listDeliveriesByWebhook,
+		arg.WebhookID,
+		arg.CompanyID,
+		arg.Limit,
+		arg.Offset,
+	)
 	if err != nil {
 		return nil, err
 	}

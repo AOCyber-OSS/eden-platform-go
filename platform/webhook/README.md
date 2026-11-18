@@ -175,7 +175,24 @@ slog.Info("retried", "count", n)
 | `WithMaxConsecutiveFailures(n)` | 10 | Auto-pause threshold. |
 | `WithHTTPTimeout(d)` | 10s | `http.Client.Timeout`. |
 | `WithDeliveryTimeout(d)` | 30s | Per-delivery `context.WithTimeout`. |
-| `WithHTTPClient(c)` | new client | Replace for custom transport / telemetry. |
+| `WithHTTPClient(c)` | guarded client | Replace for custom transport / telemetry. **Bypasses the dial-time egress guard** — dial through `netguard.Guard` in production. |
+| `WithResolver(r)` | system resolver | DNS for delivery; answers are still checked by the guard. |
+| `WithInsecureTargets(hosts...)` | none | Exact hostnames allowed to use http and private addresses. Local dev / tests only. |
+
+## Egress policy (SSRF)
+
+Target URLs are tenant-controlled, so delivery goes through the shared
+`platform/netguard` policy:
+
+- `Register` (and every delivery, for rows stored before validation) requires
+  `https` and refuses literal loopback / RFC 1918 / link-local / metadata /
+  IPv6 ULA / v4-mapped addresses and internal names (`localhost`,
+  `metadata.google.internal`, ...). `ErrInvalidURL` is returned.
+- Delivery dials through `netguard.Guard`: the host is resolved once, every
+  answer is checked, and the socket connects to exactly the checked address
+  (no DNS-rebinding window). A lookup failure fails closed.
+- Redirects are capped at 3 hops; each hop is re-validated and re-dialed
+  through the guard. No environment proxy is used.
 
 ## Standard event vocabulary
 

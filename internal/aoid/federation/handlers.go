@@ -479,6 +479,10 @@ func writeFederationError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrFederationUserNotFound),
 		errors.Is(err, ErrJITDisabled):
 		http.Error(w, "user not provisioned", http.StatusForbidden)
+	case errors.Is(err, ErrFederationEmailNotMember):
+		// #74: the IdP vouched for an account outside its tenant. A policy
+		// refusal, not a server fault; the body names no other tenant.
+		http.Error(w, "account is not a member of this tenant", http.StatusForbidden)
 	case errors.Is(err, ErrJITDomainNotAllowed):
 		http.Error(w, "email domain not allowed", http.StatusForbidden)
 	case errors.Is(err, ErrJITMFARequired):

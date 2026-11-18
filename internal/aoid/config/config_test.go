@@ -117,3 +117,16 @@ func TestParseSeedPaths(t *testing.T) {
 		})
 	}
 }
+
+// TestLoad_JWTRejectLegacyUntyped (issue #80): the env flag that closes the
+// untyped-token migration window early. Unset = window follows its cutoff.
+func TestLoad_JWTRejectLegacyUntyped(t *testing.T) {
+	t.Setenv("AOID_JWT_REJECT_LEGACY_UNTYPED", "")
+	if Load().JWTRejectLegacyUntyped {
+		t.Error("unset: JWTRejectLegacyUntyped = true, want false")
+	}
+	t.Setenv("AOID_JWT_REJECT_LEGACY_UNTYPED", "true")
+	if !Load().JWTRejectLegacyUntyped {
+		t.Error("true: JWTRejectLegacyUntyped = false, want true")
+	}
+}

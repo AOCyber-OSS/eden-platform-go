@@ -11,10 +11,10 @@ require (
 	github.com/alexedwards/scs/pgxstore v0.0.0-20251002162104-209de6e426de
 	github.com/alexedwards/scs/v2 v2.9.0
 	github.com/aws/aws-sdk-go-v2/service/kms v1.51.1
-	github.com/beevik/etree v1.6.0
+	github.com/beevik/etree v1.8.1
 	github.com/cloudflare/circl v1.6.3
 	github.com/coreos/go-oidc/v3 v3.17.0
-	github.com/crewjam/saml v0.5.1
+	github.com/crewjam/saml v0.6.3
 	github.com/getsentry/sentry-go v0.46.0
 	github.com/getsentry/sentry-go/slog v0.46.0
 	github.com/go-webauthn/webauthn v0.17.3
@@ -33,7 +33,7 @@ require (
 	github.com/pquerna/otp v1.5.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
-	github.com/russellhaering/goxmldsig v1.6.0
+	github.com/russellhaering/goxmldsig v1.6.1
 	github.com/stretchr/testify v1.11.1
 	go.opentelemetry.io/otel v1.45.0
 	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.19.0
@@ -96,7 +96,6 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/go-webauthn/x v0.2.5 // indirect
-	github.com/golang-jwt/jwt/v4 v4.5.2 // indirect
 	github.com/google/cel-go v0.27.0 // indirect
 	github.com/google/go-tpm v0.9.8 // indirect
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // indirect

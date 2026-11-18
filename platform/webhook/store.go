@@ -2,10 +2,16 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// ErrWebhookNotFound is returned by tenant-scoped store operations when no
+// webhook with the given id belongs to the given company. Callers must map it
+// to NotFound — never reveal that the id exists under another tenant.
+var ErrWebhookNotFound = errors.New("webhook: not found")
 
 // WebhookStore defines database operations for webhooks.
 type WebhookStore interface {
@@ -13,7 +19,9 @@ type WebhookStore interface {
 	GetWebhook(ctx context.Context, id uuid.UUID) (Webhook, error)
 	ListWebhooksByCompany(ctx context.Context, companyID uuid.UUID) ([]Webhook, error)
 	UpdateWebhookStatus(ctx context.Context, id uuid.UUID, active bool) error
-	DeleteWebhook(ctx context.Context, id uuid.UUID) error
+	// DeleteWebhook deletes the webhook only if it belongs to companyID;
+	// otherwise nothing is deleted and ErrWebhookNotFound is returned.
+	DeleteWebhook(ctx context.Context, companyID, id uuid.UUID) error
 	IncrementFailureCount(ctx context.Context, id uuid.UUID) (int, error)
 	ResetFailureCount(ctx context.Context, id uuid.UUID) error
 

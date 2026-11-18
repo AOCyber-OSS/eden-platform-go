@@ -75,10 +75,15 @@ func (s *WebhookStore) UpdateWebhookStatus(_ context.Context, id uuid.UUID, acti
 	return nil
 }
 
-func (s *WebhookStore) DeleteWebhook(_ context.Context, id uuid.UUID) error {
+// DeleteWebhook deletes the webhook only when it belongs to companyID.
+func (s *WebhookStore) DeleteWebhook(_ context.Context, companyID, id uuid.UUID) error {
 	s.backend.mu.Lock()
 	defer s.backend.mu.Unlock()
 
+	wh, ok := s.backend.state.webhooks[id]
+	if !ok || wh.CompanyID != companyID {
+		return webhook.ErrWebhookNotFound
+	}
 	delete(s.backend.state.webhooks, id)
 	return nil
 }
@@ -186,10 +191,15 @@ func (s *WebhookStore) ListFailedDeliveriesForRetry(_ context.Context, maxAttemp
 	return out, nil
 }
 
-// ListDeliveriesByWebhook returns deliveries for a webhook with pagination, sorted by CreatedAt DESC.
-func (s *WebhookStore) ListDeliveriesByWebhook(_ context.Context, webhookID uuid.UUID, limit, offset int) ([]webhook.WebhookDelivery, error) {
+// ListDeliveriesByWebhook returns deliveries for a webhook owned by
+// companyID with pagination, sorted by CreatedAt DESC.
+func (s *WebhookStore) ListDeliveriesByWebhook(_ context.Context, companyID, webhookID uuid.UUID, limit, offset int) ([]webhook.WebhookDelivery, error) {
 	s.backend.mu.RLock()
 	defer s.backend.mu.RUnlock()
+
+	if wh, ok := s.backend.state.webhooks[webhookID]; !ok || wh.CompanyID != companyID {
+		return nil, nil
+	}
 
 	var filtered []webhook.WebhookDelivery
 	for _, d := range s.backend.state.deliveries {

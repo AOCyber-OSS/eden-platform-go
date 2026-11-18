@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"reflect"
+	"sync"
 
 	"connectrpc.com/connect"
 	"github.com/google/uuid"
@@ -72,8 +75,8 @@ func WithDedicatedTenant(tenantID uuid.UUID) TenantScopeOption {
 	return func(o *tenantScopeOpts) { o.dedicatedTenant = tenantID }
 }
 
-// NewTenantScopeInterceptor returns a Connect unary interceptor that enforces
-// per-tenant admin access. Place this interceptor AFTER NewAdminContextInterceptor
+// NewTenantScopeInterceptor returns a Connect interceptor that enforces
+// per-tenant admin access on unary AND streaming handlers. Place this interceptor AFTER NewAdminContextInterceptor
 // in the chain — the AdminIdentity must already be in context.
 //
 // Decision tree (default mode, no options):
@@ -113,10 +116,20 @@ func WithDedicatedTenant(tenantID uuid.UUID) TenantScopeOption {
 //	    server.NewAuditInterceptor(auditLogger),         // logs actor + decision
 //	)
 //
+// Streaming (server, client, bidi): the same decision is applied to EVERY
+// message the handler receives — the extractor sees each message through a
+// request whose Any() is that message — so an own-tenant opener cannot
+// unlock a cross-tenant follow-up. The stream fails closed: a denial is
+// sticky (later Receive/Send return it), the denied message is zeroed
+// before the handler can see it, and Send is refused until at least one
+// received message has been verified (a handler cannot emit data before the
+// tenant is known). Super admins in default mode pass unwrapped. Missing
+// AdminIdentity is Unauthenticated before the handler runs.
+//
 // Backward compatibility: NewTenantScopeInterceptor(extractor) with no
 // options preserves the legacy behavior — existing Eden consumers
 // (AOSentry, AOAudit) don't need to update.
-func NewTenantScopeInterceptor(extractor TenantExtractor, opts ...TenantScopeOption) connect.UnaryInterceptorFunc {
+func NewTenantScopeInterceptor(extractor TenantExtractor, opts ...TenantScopeOption) connect.Interceptor {
 	if extractor == nil {
 		panic("server: NewTenantScopeInterceptor requires a non-nil TenantExtractor")
 	}
@@ -124,52 +137,170 @@ func NewTenantScopeInterceptor(extractor TenantExtractor, opts ...TenantScopeOpt
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	return connect.UnaryInterceptorFunc(func(next connect.UnaryFunc) connect.UnaryFunc {
-		return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
-			admin := adminauth.AdminIdentityFromContext(ctx)
-			if admin == nil {
-				return nil, connect.NewError(connect.CodeUnauthenticated,
-					errors.New("server: tenant_scope interceptor requires admin identity in context — chain NewAdminContextInterceptor first"))
-			}
-			// Dedicated mode: every request — including super_admin —
-			// must target the dedicated tenant or have no target.
-			if cfg.dedicatedTenant != uuid.Nil {
-				target, err := extractor(req)
-				if err != nil {
-					return nil, connect.NewError(connect.CodeInvalidArgument,
-						fmt.Errorf("server: tenant_id extract: %w", err))
-				}
-				if target == uuid.Nil {
-					// Chassis-wide endpoint (e.g., health, .well-known
-					// JWKS). Route/handler resolves tenant from the
-					// dedicated config. Pass.
-					return next(ctx, req)
-				}
-				if target != cfg.dedicatedTenant {
-					return nil, connect.NewError(connect.CodePermissionDenied,
-						fmt.Errorf("server: dedicated-mode: target tenant %s != dedicated %s",
-							target, cfg.dedicatedTenant))
-				}
-				return next(ctx, req)
-			}
-			// Non-dedicated path (legacy behavior, unchanged).
-			if admin.IsSuperAdmin {
-				return next(ctx, req)
-			}
-			target, err := extractor(req)
-			if err != nil {
-				return nil, connect.NewError(connect.CodeInvalidArgument,
-					fmt.Errorf("server: tenant_id extract: %w", err))
-			}
-			if target == uuid.Nil {
-				return nil, connect.NewError(connect.CodeInvalidArgument, ErrNoTargetTenant)
-			}
-			if !admin.HasTenantAccess(target) {
-				return nil, connect.NewError(connect.CodePermissionDenied,
-					fmt.Errorf("%w: admin tenant=%s target tenant=%s",
-						ErrCrossTenantAccess, admin.TenantID, target))
-			}
-			return next(ctx, req)
-		}
-	})
+	return &tenantScopeInterceptor{extractor: extractor, cfg: cfg}
 }
+
+type tenantScopeInterceptor struct {
+	extractor TenantExtractor
+	cfg       tenantScopeOpts
+}
+
+var _ connect.Interceptor = (*tenantScopeInterceptor)(nil)
+
+func errMissingAdminIdentity() error {
+	return connect.NewError(connect.CodeUnauthenticated,
+		errors.New("server: tenant_scope interceptor requires admin identity in context — chain NewAdminContextInterceptor first"))
+}
+
+// decide applies the decision tree documented on NewTenantScopeInterceptor
+// to one request (or one received stream message). nil means allowed.
+func (i *tenantScopeInterceptor) decide(admin *adminauth.AdminIdentity, req connect.AnyRequest) error {
+	// Dedicated mode: every request — including super_admin — must target
+	// the dedicated tenant or have no target.
+	if i.cfg.dedicatedTenant != uuid.Nil {
+		target, err := i.extractor(req)
+		if err != nil {
+			return connect.NewError(connect.CodeInvalidArgument,
+				fmt.Errorf("server: tenant_id extract: %w", err))
+		}
+		if target == uuid.Nil {
+			// Chassis-wide endpoint (e.g., health, .well-known JWKS).
+			// Route/handler resolves tenant from the dedicated config.
+			return nil
+		}
+		if target != i.cfg.dedicatedTenant {
+			return connect.NewError(connect.CodePermissionDenied,
+				fmt.Errorf("server: dedicated-mode: target tenant %s != dedicated %s",
+					target, i.cfg.dedicatedTenant))
+		}
+		return nil
+	}
+	// Non-dedicated path (legacy behavior, unchanged).
+	if admin.IsSuperAdmin {
+		return nil
+	}
+	target, err := i.extractor(req)
+	if err != nil {
+		return connect.NewError(connect.CodeInvalidArgument,
+			fmt.Errorf("server: tenant_id extract: %w", err))
+	}
+	if target == uuid.Nil {
+		return connect.NewError(connect.CodeInvalidArgument, ErrNoTargetTenant)
+	}
+	if !admin.HasTenantAccess(target) {
+		return connect.NewError(connect.CodePermissionDenied,
+			fmt.Errorf("%w: admin tenant=%s target tenant=%s",
+				ErrCrossTenantAccess, admin.TenantID, target))
+	}
+	return nil
+}
+
+func (i *tenantScopeInterceptor) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
+	return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+		admin := adminauth.AdminIdentityFromContext(ctx)
+		if admin == nil {
+			return nil, errMissingAdminIdentity()
+		}
+		if err := i.decide(admin, req); err != nil {
+			return nil, err
+		}
+		return next(ctx, req)
+	}
+}
+
+func (i *tenantScopeInterceptor) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
+	return func(ctx context.Context, conn connect.StreamingHandlerConn) error {
+		admin := adminauth.AdminIdentityFromContext(ctx)
+		if admin == nil {
+			return errMissingAdminIdentity()
+		}
+		if i.cfg.dedicatedTenant == uuid.Nil && admin.IsSuperAdmin {
+			return next(ctx, conn)
+		}
+		return next(ctx, &tenantScopedConn{StreamingHandlerConn: conn, admin: admin, scope: i})
+	}
+}
+
+// WrapStreamingClient is a pass-through: tenant scope is a server-side check.
+func (i *tenantScopeInterceptor) WrapStreamingClient(next connect.StreamingClientFunc) connect.StreamingClientFunc {
+	return next
+}
+
+// tenantScopedConn checks every received message and gates Send until a
+// message has been verified. Denials are sticky.
+type tenantScopedConn struct {
+	connect.StreamingHandlerConn
+	admin *adminauth.AdminIdentity
+	scope *tenantScopeInterceptor
+
+	mu       sync.Mutex
+	verified bool
+	denied   error
+}
+
+func (c *tenantScopedConn) Receive(msg any) error {
+	c.mu.Lock()
+	denied := c.denied
+	c.mu.Unlock()
+	if denied != nil {
+		return denied
+	}
+	if err := c.StreamingHandlerConn.Receive(msg); err != nil {
+		return err
+	}
+	err := c.scope.decide(c.admin, &streamMessageRequest{
+		AnyRequest: connect.NewRequest(&struct{}{}),
+		msg:        msg,
+		spec:       c.Spec(),
+		peer:       c.Peer(),
+		header:     c.RequestHeader(),
+	})
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err != nil {
+		c.denied = err
+		zeroMessage(msg)
+		return err
+	}
+	c.verified = true
+	return nil
+}
+
+func (c *tenantScopedConn) Send(msg any) error {
+	c.mu.Lock()
+	denied, verified := c.denied, c.verified
+	c.mu.Unlock()
+	if denied != nil {
+		return denied
+	}
+	if !verified {
+		return connect.NewError(connect.CodePermissionDenied,
+			errors.New("server: tenant_scope: stream tenant not verified yet — refusing to send before a request message is checked"))
+	}
+	return c.StreamingHandlerConn.Send(msg)
+}
+
+// zeroMessage clears a denied message in place so a handler that ignores
+// the Receive error cannot act on it.
+func zeroMessage(msg any) {
+	v := reflect.ValueOf(msg)
+	if v.Kind() == reflect.Pointer && !v.IsNil() && v.Elem().CanSet() {
+		v.Elem().Set(reflect.Zero(v.Elem().Type()))
+	}
+}
+
+// streamMessageRequest presents one received stream message to a
+// TenantExtractor as a connect.AnyRequest (extractors switch on Any()).
+// The embedded placeholder request supplies connect's unexported methods.
+type streamMessageRequest struct {
+	connect.AnyRequest
+	msg    any
+	spec   connect.Spec
+	peer   connect.Peer
+	header http.Header
+}
+
+func (r *streamMessageRequest) Any() any            { return r.msg }
+func (r *streamMessageRequest) Spec() connect.Spec  { return r.spec }
+func (r *streamMessageRequest) Peer() connect.Peer  { return r.peer }
+func (r *streamMessageRequest) Header() http.Header { return r.header }

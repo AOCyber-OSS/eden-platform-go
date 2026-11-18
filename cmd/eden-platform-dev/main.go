@@ -93,7 +93,7 @@ func runServer(
 	},
 	auditQuerier connectapi.AuditLogQuerier,
 	deliveryQ interface {
-		ListDeliveriesByWebhook(context.Context, uuid.UUID, int, int) ([]webhook.WebhookDelivery, error)
+		ListDeliveriesByWebhook(ctx context.Context, companyID, webhookID uuid.UUID, limit, offset int) ([]webhook.WebhookDelivery, error)
 	},
 ) {
 	jwtManager, err := auth.NewJWTManager(auth.JWTConfig{

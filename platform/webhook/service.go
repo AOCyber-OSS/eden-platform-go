@@ -6,16 +6,19 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"math"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"go.aocyber.ai/eden-platform-go/platform/netguard"
 )
 
 // Default service limits. Override via Service options.
@@ -34,6 +37,9 @@ type Service struct {
 	maxRetries             int
 	maxConsecutiveFailures int
 	deliveryTimeout        time.Duration
+	resolver               netguard.Resolver
+	insecureHosts          map[string]bool
+	customClient           bool
 }
 
 // ServiceOption configures a Service.
@@ -65,8 +71,69 @@ func WithDeliveryTimeout(d time.Duration) ServiceOption {
 
 // WithHTTPClient replaces the underlying HTTP client (for tests, custom
 // transports, or telemetry instrumentation).
+//
+// SECURITY: a replacement client BYPASSES the dial-time egress guard
+// (Register/delivery URL validation still applies). A production client
+// must dial through netguard.Guard — e.g. Transport: (&netguard.Guard{}).Transport().
 func WithHTTPClient(c *http.Client) ServiceOption {
-	return func(s *Service) { s.client = c }
+	return func(s *Service) { s.client = c; s.customClient = true }
+}
+
+// ErrInvalidURL is returned (wrapped) by Register — and recorded on the
+// delivery — for a target URL the egress policy refuses.
+var ErrInvalidURL = errors.New("webhook: invalid or disallowed target URL")
+
+// DefaultMaxRedirects caps redirect hops followed on delivery; every hop is
+// re-validated and dialed through the egress guard.
+const DefaultMaxRedirects = 3
+
+// WithResolver overrides DNS resolution for delivery (nil: system resolver).
+// Resolved addresses are always checked by the egress guard.
+func WithResolver(r netguard.Resolver) ServiceOption {
+	return func(s *Service) { s.resolver = r }
+}
+
+// WithInsecureTargets exempts the listed hosts (exact URL hostnames, e.g.
+// "127.0.0.1" or "receiver.local") from the egress policy: they may use
+// http and resolve to private addresses. For local development and tests
+// ONLY — never pass tenant-controlled values here.
+func WithInsecureTargets(hosts ...string) ServiceOption {
+	return func(s *Service) {
+		if s.insecureHosts == nil {
+			s.insecureHosts = map[string]bool{}
+		}
+		for _, h := range hosts {
+			s.insecureHosts[strings.ToLower(h)] = true
+		}
+	}
+}
+
+// ValidateTargetURL applies the webhook egress policy to a target URL
+// without DNS: https only (http only for WithInsecureTargets hosts), a host
+// is required, and literal internal IPs / internal names are refused.
+// Resolved addresses are checked again when delivery dials.
+func (s *Service) ValidateTargetURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidURL, err)
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return fmt.Errorf("%w: no host", ErrInvalidURL)
+	}
+	if s.insecureHosts[host] {
+		if u.Scheme != "https" && u.Scheme != "http" {
+			return fmt.Errorf("%w: scheme %q", ErrInvalidURL, u.Scheme)
+		}
+		return nil
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("%w: scheme %q (https required)", ErrInvalidURL, u.Scheme)
+	}
+	if err := netguard.CheckHost(host); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidURL, err)
+	}
+	return nil
 }
 
 // NewService creates a new webhook service. Defaults match the historical
@@ -85,11 +152,31 @@ func NewService(store WebhookStore, opts ...ServiceOption) *Service {
 	for _, opt := range opts {
 		opt(s)
 	}
+	if !s.customClient {
+		guard := &netguard.Guard{
+			Resolver:  s.resolver,
+			AllowHost: func(h string) bool { return s.insecureHosts[strings.ToLower(h)] },
+		}
+		s.client.Transport = guard.Transport()
+		s.client.CheckRedirect = s.checkRedirect
+	}
 	return s
+}
+
+// checkRedirect re-applies the URL policy to every redirect hop; the hop's
+// connection is also dialed through the egress guard.
+func (s *Service) checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= DefaultMaxRedirects {
+		return fmt.Errorf("webhook: stopped after %d redirects", DefaultMaxRedirects)
+	}
+	return s.ValidateTargetURL(req.URL.String())
 }
 
 // Register creates a new webhook subscription.
 func (s *Service) Register(ctx context.Context, companyID uuid.UUID, url, secret string, events []string) (Webhook, error) {
+	if err := s.ValidateTargetURL(url); err != nil {
+		return Webhook{}, err
+	}
 	if secret == "" {
 		secret = generateSecret()
 	}
@@ -135,6 +222,13 @@ func (s *Service) deliver(parent context.Context, wh Webhook, delivery WebhookDe
 	timestamp := time.Now().Unix()
 	signature := sign(wh.Secret, fmt.Sprintf("%d", timestamp), delivery.Payload)
 	sigHeader := fmt.Sprintf("t=%d,v1=%s", timestamp, signature)
+
+	// Re-validate on every delivery: rows written before Register validated
+	// URLs (or by another writer) must not bypass the policy.
+	if err := s.ValidateTargetURL(wh.URL); err != nil {
+		s.recordFailure(ctx, wh, delivery, 0, err.Error())
+		return
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, wh.URL, strings.NewReader(delivery.Payload))
 	if err != nil {

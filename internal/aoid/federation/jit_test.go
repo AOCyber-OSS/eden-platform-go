@@ -5,24 +5,35 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/google/uuid"
 	"go.aocyber.ai/eden-platform-go/platform/auth"
 	"go.aocyber.ai/eden-platform-go/platform/devstore"
+	"go.aocyber.ai/eden-platform-go/platform/rbac"
 )
 
 func newProvisionSvc(t *testing.T) *auth.Service {
 	t.Helper()
-	backend := devstore.NewMemoryBackend()
+	svc, _ := newProvisionSvcAndStore(t)
+	return svc
+}
+
+func newProvisionSvcAndStore(t *testing.T) (*auth.Service, auth.AuthStore) {
+	t.Helper()
+	store := devstore.NewMemoryBackend().AuthStore()
 	jwtCfg := auth.DefaultJWTConfig()
 	jwt, err := auth.NewJWTManager(jwtCfg)
 	if err != nil {
 		t.Fatalf("NewJWTManager: %v", err)
 	}
-	return auth.NewService(backend.AuthStore(), jwt, auth.NewPasswordHasher())
+	return auth.NewService(store, jwt, auth.NewPasswordHasher()), store
 }
+
+// provisionTenant is the asserting tenant in the single-tenant Provision tests.
+var provisionTenant = uuid.MustParse("11111111-1111-1111-1111-111111111111")
 
 func TestProvision_NewUser(t *testing.T) {
 	svc := newProvisionSvc(t)
-	user, isNew, err := Provision(context.Background(), svc, "u@acme.com", "U User", JITPolicy{Enabled: true})
+	user, isNew, err := Provision(context.Background(), svc, provisionTenant, "u@acme.com", "U User", JITPolicy{Enabled: true})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
@@ -40,10 +51,14 @@ func TestProvision_NewUser(t *testing.T) {
 	}
 }
 
+// An existing MEMBER of the asserting tenant resolves, even with JIT off.
 func TestProvision_ExistingUser(t *testing.T) {
-	svc := newProvisionSvc(t)
-	_, _ = svc.CreateUser(context.Background(), "u@acme.com", "$2a$10$dummy", "Original")
-	user, isNew, err := Provision(context.Background(), svc, "u@acme.com", "Original", JITPolicy{Enabled: false})
+	svc, store := newProvisionSvcAndStore(t)
+	existing, _ := svc.CreateUser(context.Background(), "u@acme.com", "$2a$10$dummy", "Original")
+	if err := store.CreateCompanyMembership(context.Background(), provisionTenant, existing.ID, rbac.MemberRoleID); err != nil {
+		t.Fatalf("CreateCompanyMembership: %v", err)
+	}
+	user, isNew, err := Provision(context.Background(), svc, provisionTenant, "u@acme.com", "Original", JITPolicy{Enabled: false})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
@@ -57,7 +72,7 @@ func TestProvision_ExistingUser(t *testing.T) {
 
 func TestProvision_JITDisabled(t *testing.T) {
 	svc := newProvisionSvc(t)
-	_, _, err := Provision(context.Background(), svc, "unknown@acme.com", "", JITPolicy{Enabled: false})
+	_, _, err := Provision(context.Background(), svc, provisionTenant, "unknown@acme.com", "", JITPolicy{Enabled: false})
 	if !errors.Is(err, ErrFederationUserNotFound) {
 		t.Errorf("expected ErrFederationUserNotFound, got %v", err)
 	}
@@ -66,7 +81,7 @@ func TestProvision_JITDisabled(t *testing.T) {
 func TestProvision_DomainRejected(t *testing.T) {
 	svc := newProvisionSvc(t)
 	policy := JITPolicy{Enabled: true, AllowedDomains: []string{"acme.com"}}
-	_, _, err := Provision(context.Background(), svc, "user@evil.com", "", policy)
+	_, _, err := Provision(context.Background(), svc, provisionTenant, "user@evil.com", "", policy)
 	if !errors.Is(err, ErrJITDomainNotAllowed) {
 		t.Errorf("expected ErrJITDomainNotAllowed, got %v", err)
 	}
@@ -74,7 +89,7 @@ func TestProvision_DomainRejected(t *testing.T) {
 
 func TestProvision_DefaultDisplayName(t *testing.T) {
 	svc := newProvisionSvc(t)
-	user, _, err := Provision(context.Background(), svc, "u@acme.com", "", JITPolicy{Enabled: true})
+	user, _, err := Provision(context.Background(), svc, provisionTenant, "u@acme.com", "", JITPolicy{Enabled: true})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}

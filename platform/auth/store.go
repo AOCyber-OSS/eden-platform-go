@@ -126,6 +126,20 @@ type SocialStore interface {
 	DeleteUserIdentity(ctx context.Context, id uuid.UUID) error
 }
 
+// ErrRefreshTokenNotActive is returned by RefreshTokenConsumer when no
+// active (unrevoked, unexpired) refresh token matched: it was already used,
+// revoked, expired or never issued.
+var ErrRefreshTokenNotActive = errors.New("refresh token not active")
+
+// RefreshTokenConsumer is an optional AuthStore capability: revoke a refresh
+// token only if it is still active, atomically, reporting
+// ErrRefreshTokenNotActive otherwise. Service refresh rotation uses it so two
+// concurrent redeems of one token cannot both succeed. Stores without it fall
+// back to RevokeRefreshToken, which keeps that race.
+type RefreshTokenConsumer interface {
+	ConsumeRefreshToken(ctx context.Context, tokenHash string) error
+}
+
 // AuthStore defines the database operations needed by the auth package.
 // Consuming apps implement this with their sqlc-generated code.
 type AuthStore interface {

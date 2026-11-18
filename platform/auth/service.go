@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/mail"
@@ -101,7 +102,7 @@ func (s *Service) SignUp(ctx context.Context, email, password, displayName strin
 		return nil, fmt.Errorf("create access token: %w", err)
 	}
 
-	refreshToken, err := s.jwtManager.CreateRefreshToken(user.ID.String())
+	refreshToken, err := s.jwtManager.CreateCompanyRefreshToken(user.ID.String(), companyIDStr)
 	if err != nil {
 		return nil, fmt.Errorf("create refresh token: %w", err)
 	}
@@ -154,7 +155,7 @@ func (s *Service) Login(ctx context.Context, email, password string) (*AuthRespo
 		return nil, fmt.Errorf("create access token: %w", err)
 	}
 
-	refreshToken, err := s.jwtManager.CreateRefreshToken(user.ID.String())
+	refreshToken, err := s.jwtManager.CreateCompanyRefreshToken(user.ID.String(), companyIDStr)
 	if err != nil {
 		return nil, fmt.Errorf("create refresh token: %w", err)
 	}
@@ -242,21 +243,107 @@ func (s *Service) JWTManagerForTest() *JWTManager {
 	return s.jwtManager
 }
 
+// MembershipLister is an optional AuthStore capability: the ids of every
+// company the user belongs to. Service.RefreshToken uses it only to redeem a
+// pre-#80 refresh token, which names no company: such a token is redeemed
+// only when the user belongs to exactly one company. A store without it
+// cannot redeem those tokens (fail closed).
+type MembershipLister interface {
+	ListUserCompanyIDs(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error)
+}
+
 // RefreshToken validates, revokes old, and issues new token pair.
+//
+// The new access token is scoped exactly as the refresh token says, never by
+// a guess from the user's memberships:
+//   - company-bound (cid claim, from CreateCompanyRefreshToken): re-minted
+//     for that company only, with the role the user holds there now; refused
+//     if the user is no longer a member.
+//   - typed but company-less (CreateRefreshToken): re-minted company-less.
+//   - pre-#80 (no token_use, legacy window only): redeemed only when the user
+//     belongs to exactly one company, which is then the company; refused
+//     otherwise, because the issuing company cannot be known.
+//
+// It redeems only refresh tokens that are not bound to an OAuth client: a
+// token issued to a client by AO ID (aud = client id) must be redeemed through
+// RefreshTokenForClient by that client, or the binding could be bypassed here.
 func (s *Service) RefreshToken(ctx context.Context, refreshTokenStr string) (*AuthResponse, error) {
-	_, err := s.jwtManager.ValidateRefreshToken(refreshTokenStr)
+	claims, err := s.jwtManager.ValidateRefreshTokenClaims(refreshTokenStr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid refresh token")
 	}
+	if len(claims.Audience) > 0 {
+		return nil, fmt.Errorf("invalid refresh token: bound to a client")
+	}
+	return s.rotateRefresh(ctx, refreshTokenStr, claims, refreshScope{legacyGuess: claims.TokenUse == ""},
+		func(userID, companyID string) (string, error) {
+			if companyID == "" {
+				return s.jwtManager.CreateRefreshToken(userID)
+			}
+			return s.jwtManager.CreateCompanyRefreshToken(userID, companyID)
+		})
+}
 
+// RefreshTokenForClient is RefreshToken for an OAuth refresh_token grant
+// (issue #80). The refresh token must be bound to clientID (its aud, set by
+// JWTManager.CreateClientRefreshToken), and the rotated refresh token is bound
+// to clientID again. The binding is checked before the old token is revoked,
+// so a wrong-client attempt does not burn the owner's token.
+//
+// Company scope follows the token as in RefreshToken, except that a
+// company-less token (every AO ID token today, and pre-#80 ones) re-mints the
+// company-less "user" access token AO ID issues at the code grant — never a
+// company picked from the user's memberships.
+//
+// Migration: a pre-#80 refresh token (no token_use, so no binding) is
+// accepted while the JWTManager's legacy window is open and is re-issued bound
+// to the presenting client. A typed refresh token without a binding (minted by
+// a password/SSO login, not by an OAuth client) is rejected.
+func (s *Service) RefreshTokenForClient(ctx context.Context, refreshTokenStr, clientID string) (*AuthResponse, error) {
+	if clientID == "" {
+		return nil, fmt.Errorf("invalid refresh token: empty client id")
+	}
+	claims, err := s.jwtManager.ValidateRefreshTokenClaims(refreshTokenStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid refresh token")
+	}
+	legacyUnbound := claims.TokenUse == "" && len(claims.Audience) == 0
+	// A federation-bridge token is issued before any OAuth client is known
+	// (the federation flow carries none). It is company-bound, and the first
+	// client to redeem it gets a token bound to that client from then on.
+	federation := len(claims.Audience) == 1 && claims.Audience[0] == FederationRefreshAudience && claims.CompanyID != ""
+	if !legacyUnbound && !federation && !(len(claims.Audience) == 1 && claims.Audience[0] == clientID) {
+		return nil, fmt.Errorf("invalid refresh token: not issued to this client")
+	}
+	return s.rotateRefresh(ctx, refreshTokenStr, claims, refreshScope{companyLessRole: "user"},
+		func(userID, companyID string) (string, error) {
+			return s.jwtManager.CreateClientCompanyRefreshToken(userID, clientID, companyID)
+		})
+}
+
+// FederationRefreshAudience is the aud of a refresh token minted by the AO ID
+// federation bridge, which has no OAuth client to bind to. Such a token must
+// also be company-bound; see RefreshTokenForClient.
+const FederationRefreshAudience = "aoid:federation"
+
+// refreshScope tunes how rotateRefresh scopes a company-less refresh token.
+type refreshScope struct {
+	// legacyGuess: the token predates #80 and names no company; resolve the
+	// company only when the user has exactly one membership.
+	legacyGuess bool
+	// companyLessRole is the role stamped on a company-less access token.
+	companyLessRole string
+}
+
+// rotateRefresh looks up, revokes and replaces a validated refresh token. The
+// company scope is resolved and checked before the old token is revoked, so a
+// refused refresh never burns the token. mintRefresh mints the replacement for
+// (userID, companyID), companyID empty for a company-less session.
+func (s *Service) rotateRefresh(ctx context.Context, refreshTokenStr string, claims *RefreshClaims, scope refreshScope, mintRefresh func(userID, companyID string) (string, error)) (*AuthResponse, error) {
 	tokenHash := HashToken(refreshTokenStr)
 	storedToken, err := s.store.GetRefreshToken(ctx, tokenHash)
 	if err != nil {
 		return nil, fmt.Errorf("refresh token not found or expired")
-	}
-
-	if err := s.store.RevokeRefreshToken(ctx, tokenHash); err != nil {
-		return nil, fmt.Errorf("revoke old refresh token: %w", err)
 	}
 
 	user, err := s.store.GetUserByID(ctx, storedToken.UserID)
@@ -264,23 +351,45 @@ func (s *Service) RefreshToken(ctx context.Context, refreshTokenStr string) (*Au
 		return nil, fmt.Errorf("get user: %w", err)
 	}
 
-	membership, err := s.store.GetCompanyMembershipByUser(ctx, user.ID)
-	if err != nil {
-		return nil, fmt.Errorf("get company membership: %w", err)
+	companyID := uuid.Nil
+	switch {
+	case claims.CompanyID != "":
+		companyID, err = uuid.Parse(claims.CompanyID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid refresh token: bad company")
+		}
+	case scope.legacyGuess:
+		companyID, err = s.soleCompany(ctx, user.ID)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	role, err := s.store.GetRoleByID(ctx, membership.RoleID)
-	if err != nil {
-		return nil, fmt.Errorf("get role: %w", err)
+	var role Role
+	if companyID != uuid.Nil {
+		// Re-read the role in the bound company; fails if no longer a member.
+		role, err = s.store.GetUserRole(ctx, companyID, user.ID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid refresh token: not a member of the session's company")
+		}
 	}
 
-	companyIDStr := membership.CompanyID.String()
-	newAccessToken, err := s.jwtManager.CreateAccessToken(user.ID.String(), companyIDStr, role.Name, role.RoleLevel, []string{companyIDStr})
+	if err := s.consumeRefresh(ctx, tokenHash); err != nil {
+		return nil, err
+	}
+
+	var newAccessToken, companyIDStr string
+	if companyID != uuid.Nil {
+		companyIDStr = companyID.String()
+		newAccessToken, err = s.jwtManager.CreateAccessToken(user.ID.String(), companyIDStr, role.Name, role.RoleLevel, []string{companyIDStr})
+	} else {
+		newAccessToken, err = s.jwtManager.CreateAccessToken(user.ID.String(), "", scope.companyLessRole, 0, nil)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("create access token: %w", err)
 	}
 
-	newRefreshToken, err := s.jwtManager.CreateRefreshToken(user.ID.String())
+	newRefreshToken, err := mintRefresh(user.ID.String(), companyIDStr)
 	if err != nil {
 		return nil, fmt.Errorf("create refresh token: %w", err)
 	}
@@ -291,6 +400,44 @@ func (s *Service) RefreshToken(ctx context.Context, refreshTokenStr string) (*Au
 	}
 
 	return &AuthResponse{AccessToken: newAccessToken, RefreshToken: newRefreshToken, User: user}, nil
+}
+
+// consumeRefresh revokes the old refresh token, single-use: with a
+// RefreshTokenConsumer store a token another redeem already consumed is
+// refused here, so concurrent redeems yield one new pair.
+func (s *Service) consumeRefresh(ctx context.Context, tokenHash string) error {
+	if c, ok := s.store.(RefreshTokenConsumer); ok {
+		if err := c.ConsumeRefreshToken(ctx, tokenHash); err != nil {
+			if errors.Is(err, ErrRefreshTokenNotActive) {
+				return fmt.Errorf("refresh token already used or revoked")
+			}
+			return fmt.Errorf("revoke old refresh token: %w", err)
+		}
+		return nil
+	}
+	if err := s.store.RevokeRefreshToken(ctx, tokenHash); err != nil {
+		return fmt.Errorf("revoke old refresh token: %w", err)
+	}
+	return nil
+}
+
+// soleCompany returns the user's only company, for a pre-#80 refresh token
+// that names none. More than one membership (or a store that cannot list
+// them) is refused: the issuing company is unknowable, and picking one is the
+// tenant escalation this guards against.
+func (s *Service) soleCompany(ctx context.Context, userID uuid.UUID) (uuid.UUID, error) {
+	lister, ok := s.store.(MembershipLister)
+	if !ok {
+		return uuid.Nil, fmt.Errorf("invalid refresh token: legacy token names no company; sign in again")
+	}
+	ids, err := lister.ListUserCompanyIDs(ctx, userID)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("list memberships: %w", err)
+	}
+	if len(ids) != 1 {
+		return uuid.Nil, fmt.Errorf("invalid refresh token: legacy token names no company; sign in again")
+	}
+	return ids[0], nil
 }
 
 // UpdateProfile updates the user's display name and avatar URL.
@@ -308,12 +455,21 @@ func (s *Service) Logout(ctx context.Context, refreshTokenStr string) error {
 }
 
 // RememberRefreshToken records a freshly-minted refresh token in the
-// auth store so it can be rotated later via RefreshToken.
+// auth store so it can be rotated later via RefreshToken (or, for a
+// client-bound token, RefreshTokenForClient).
 //
-// Used by external issuers (e.g. AO ID) that mint a refresh token via
-// JWTManager.CreateRefreshToken outside the SignUp/Login pipeline and
-// still need rotation to work. The platform's own SignUp + Login paths
-// embed this call inside their transactions.
+// Used by callers that mint a refresh token outside the SignUp/Login
+// pipeline (a company switch, an onboarding redeem) and still need rotation
+// to work. The platform's own SignUp + Login paths embed this call inside
+// their transactions.
+//
+// Mint the token for the session it belongs to (issue #80): a refresh
+// re-mints exactly what the token names. A company-scoped session must use
+// JWTManager.CreateCompanyRefreshToken(userID, companyID); a token from
+// CreateRefreshToken names no company, so RefreshToken re-mints a
+// company-less access token from it (RequireCompany then fails). Tokens
+// handed to an OAuth client use CreateClientRefreshToken and are redeemed
+// only through RefreshTokenForClient.
 func (s *Service) RememberRefreshToken(ctx context.Context, userID uuid.UUID, refreshTokenStr string, expiresAt time.Time) error {
 	tokenHash := HashToken(refreshTokenStr)
 	return s.store.CreateRefreshToken(ctx, userID, tokenHash, expiresAt)
@@ -332,6 +488,43 @@ func (s *Service) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 // provision without re-importing the store interface.
 func (s *Service) GetUserByEmail(ctx context.Context, email string) (User, error) {
 	return s.store.GetUserByEmail(ctx, strings.ToLower(strings.TrimSpace(email)))
+}
+
+// GetUserRole returns userID's role in companyID, or an error when the user
+// is not a member of that company. Exposed so federation flows can scope an
+// email match to the asserting tenant (#74).
+func (s *Service) GetUserRole(ctx context.Context, companyID, userID uuid.UUID) (Role, error) {
+	return s.store.GetUserRole(ctx, companyID, userID)
+}
+
+// CreateUserWithMembership creates a user and their membership in companyID
+// in ONE transaction, so a failed membership never leaves a user row behind.
+// Under the SSO/federation refuse-non-members rule (#74) such a user could
+// never sign in again. Used by federation JIT.
+func (s *Service) CreateUserWithMembership(ctx context.Context, email, passwordHash, displayName string, companyID, roleID uuid.UUID) (User, error) {
+	return createUserWithMembership(ctx, s.store, email, passwordHash, displayName, companyID, roleID)
+}
+
+// createUserWithMembership runs CreateUser + CreateCompanyMembership in one
+// transaction on store.
+func createUserWithMembership(ctx context.Context, store TxAuthStore, email, passwordHash, displayName string, companyID, roleID uuid.UUID) (User, error) {
+	tx, err := store.BeginTx(ctx)
+	if err != nil {
+		return User{}, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	user, err := tx.CreateUser(ctx, strings.ToLower(strings.TrimSpace(email)), passwordHash, strings.TrimSpace(displayName))
+	if err != nil {
+		return User{}, fmt.Errorf("create user: %w", err)
+	}
+	if err := tx.CreateCompanyMembership(ctx, companyID, user.ID, roleID); err != nil {
+		return User{}, fmt.Errorf("create company membership: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return User{}, fmt.Errorf("commit transaction: %w", err)
+	}
+	return user, nil
 }
 
 // CreateUser inserts a new user. Federation callers supply an unusable

@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"strings"
 
@@ -30,7 +31,7 @@ import (
 // A Config with an empty or unparseable IDPCert cannot verify anything and is
 // REJECTED (returns an error) — it is never verify-skipped. On success it returns
 // the SAME attribute-map shape ParseResponseUnverified returns (default mapping
-// overlaid by cfg.AttributeMapping, with a NameID fallback for email), only now
+// overlaid by cfg.AttributeMapping, with a guarded NameID fallback for email), only now
 // computed over cryptographically-verified data.
 func VerifyResponse(samlResponse string, cfg Config) (map[string]string, error) {
 	sp, err := buildVerifyingSP(cfg)
@@ -118,7 +119,8 @@ func buildVerifyingSP(cfg Config) (*saml.ServiceProvider, error) {
 // attribute-map shape ParseResponseUnverified produces: the package default
 // mapping (target -> source) overlaid by cfg.AttributeMapping, honouring both the
 // attribute Name and FriendlyName as source keys, with a NameID fallback for
-// email. It runs only on cryptographically-verified data.
+// email (see nameIDEmail for when it applies). It runs only on
+// cryptographically-verified data.
 func mapVerifiedAttributes(assertion *saml.Assertion, cfg Config) map[string]string {
 	raw := make(map[string]string)
 	if assertion != nil {
@@ -150,10 +152,44 @@ func mapVerifiedAttributes(assertion *saml.Assertion, cfg Config) map[string]str
 		}
 	}
 
-	if _, ok := result["email"]; !ok && assertion != nil {
-		if assertion.Subject != nil && assertion.Subject.NameID != nil {
-			result["email"] = assertion.Subject.NameID.Value
+	if _, ok := result["email"]; !ok {
+		if email, ok := nameIDEmail(assertion); ok {
+			result["email"] = email
 		}
 	}
 	return result
+}
+
+// nameIDFormatEmailAddress is the SAML 1.1 NameID format an IdP uses to say the
+// NameID value is an email address (saml-core-2.0-os §8.3.2).
+const nameIDFormatEmailAddress = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"
+
+// nameIDEmail returns the NameID as an email only when that is what the IdP
+// signed (#73, GO-2026-6909):
+//
+//   - the NameID is the saml-namespaced element: crewjam/saml >= v0.6 binds
+//     Subject.NameID to the SAML assertion namespace, so a foreign <NameID>
+//     can no longer fill it;
+//   - its Format is emailAddress, the IdP's own statement that the value is an
+//     address. A persistent or transient NameID is an opaque per-IdP handle;
+//     treating one as an email would let an IdP name any account by choosing
+//     an address-shaped handle;
+//   - the value parses as a bare address.
+//
+// Many IdPs (Okta and Entra defaults) send the address only as an emailAddress
+// NameID, so dropping the fallback entirely would break real logins.
+func nameIDEmail(assertion *saml.Assertion) (string, bool) {
+	if assertion == nil || assertion.Subject == nil || assertion.Subject.NameID == nil {
+		return "", false
+	}
+	nameID := assertion.Subject.NameID
+	if nameID.Format != nameIDFormatEmailAddress {
+		return "", false
+	}
+	value := strings.TrimSpace(nameID.Value)
+	addr, err := mail.ParseAddress(value)
+	if err != nil || addr.Address != value {
+		return "", false
+	}
+	return value, true
 }

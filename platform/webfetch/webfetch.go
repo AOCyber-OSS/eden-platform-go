@@ -19,6 +19,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"go.aocyber.ai/eden-platform-go/platform/netguard"
 )
 
 // Defaults
@@ -50,6 +52,8 @@ type Policy struct {
 	ReadTimeout            time.Duration
 	UserAgent              string
 	AdditionalHeaders      map[string]string
+	// Resolver overrides DNS resolution (nil: system resolver).
+	Resolver netguard.Resolver
 }
 
 // Result is a fetched HTTP response.
@@ -101,8 +105,21 @@ func NewClient(p Policy) (*Client, error) {
 	}
 
 	dialer := &net.Dialer{Timeout: p.ConnectTimeout}
+	dial := dialer.DialContext
+	if p.DenyPrivateIPs {
+		// The address policy is enforced on the connected address by the
+		// shared netguard dialer (one lookup, checked, then dialed — no
+		// rebinding window). Allow-listed hosts bypass it, as before.
+		guard := &netguard.Guard{
+			Resolver:  p.Resolver,
+			Dialer:    dialer,
+			AllowHost: func(host string) bool { return matchAny(allowHosts, host) },
+		}
+		dial = guard.DialContext
+	}
 	transport := &http.Transport{
-		DialContext:           dialer.DialContext,
+		Proxy:                 nil, // an env proxy would make the connected address the proxy's
+		DialContext:           dial,
 		ResponseHeaderTimeout: p.ReadTimeout,
 		ExpectContinueTimeout: time.Second,
 		TLSHandshakeTimeout:   p.ConnectTimeout,
@@ -189,6 +206,10 @@ func (c *Client) FetchWith(ctx context.Context, req *http.Request) (*Result, err
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		// The dial-time egress guard refused the connected address.
+		if errors.Is(err, netguard.ErrBlocked) && !errors.Is(err, ErrPolicyViolation) {
+			return nil, fmt.Errorf("%w: %w", ErrPolicyViolation, err)
+		}
 		// Surface our policy errors verbatim (CheckRedirect may have set them).
 		if errors.Is(err, ErrTooManyRedirects) || errors.Is(err, ErrPolicyViolation) {
 			return nil, err
@@ -253,9 +274,13 @@ func (c *Client) validateURL(u *url.URL) error {
 		return fmt.Errorf("%w: host %q matches deny pattern", ErrPolicyViolation, host)
 	}
 
+	// Literal IPs and well-known internal names are refused here, before any
+	// DNS. Resolved addresses are checked at dial time by netguard.Guard —
+	// the only place a hostname's answer is trusted, so it is the address
+	// actually connected to.
 	if c.policy.DenyPrivateIPs {
-		if err := denyPrivateIP(host); err != nil {
-			return err
+		if err := netguard.CheckHost(host); err != nil {
+			return fmt.Errorf("%w: %w", ErrPolicyViolation, err)
 		}
 	}
 	return nil
@@ -269,56 +294,6 @@ func (c *Client) schemeAllowed(scheme string, allowed []string) bool {
 		}
 	}
 	return false
-}
-
-// denyPrivateIP rejects loopback, RFC 1918, link-local (incl. cloud
-// metadata 169.254.169.254), unspecified, multicast.
-func denyPrivateIP(host string) error {
-	// Direct-IP path: parse, then check.
-	if ip := net.ParseIP(host); ip != nil {
-		return checkIPDeny(ip, host)
-	}
-
-	// Hostname path: catch the well-known unsafe hostnames before resolution.
-	hostname := strings.ToLower(host)
-	for _, blocked := range []string{
-		"localhost",
-		"localhost.localdomain",
-		"metadata.google.internal",
-	} {
-		if hostname == blocked {
-			return fmt.Errorf("%w: host %q is blocked", ErrPolicyViolation, host)
-		}
-	}
-
-	// Resolve and check every IP. Failure to resolve is treated as a
-	// soft-allow — the underlying request will fail anyway.
-	addrs, err := net.LookupIP(host)
-	if err != nil {
-		return nil
-	}
-	for _, ip := range addrs {
-		if ipErr := checkIPDeny(ip, host); ipErr != nil {
-			return ipErr
-		}
-	}
-	return nil
-}
-
-func checkIPDeny(ip net.IP, host string) error {
-	switch {
-	case ip.IsLoopback():
-		return fmt.Errorf("%w: loopback IP %s", ErrPolicyViolation, host)
-	case ip.IsPrivate():
-		return fmt.Errorf("%w: private IP %s (RFC 1918)", ErrPolicyViolation, host)
-	case ip.IsLinkLocalUnicast():
-		return fmt.Errorf("%w: link-local IP %s", ErrPolicyViolation, host)
-	case ip.IsUnspecified():
-		return fmt.Errorf("%w: unspecified IP %s", ErrPolicyViolation, host)
-	case ip.IsMulticast():
-		return fmt.Errorf("%w: multicast IP %s", ErrPolicyViolation, host)
-	}
-	return nil
 }
 
 func compileRegexps(patterns []string) ([]*regexp.Regexp, error) {

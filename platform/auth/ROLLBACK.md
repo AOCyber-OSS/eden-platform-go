@@ -88,11 +88,13 @@ for other consumers.
 ## Why this works
 
 The platform/auth absorption is a **promotion**, not a rewrite. Every
-public-API name and behavior in `platform/auth/oauth`, `oidc`, `saml`,
+public-API name and behavior in `oidc`, `saml`,
 `webauthn`, `totp`, `emailotp`, `apikey`, `session`, and `legacy_bcrypt` is
 either a 1:1 copy of the AODex source (with package-level imports adjusted)
 or a strict superset (e.g. session manager exposes a `NewWithStore`
 constructor for tests; the donor's API is preserved).
+(`platform/auth/oauth` was promoted the same way and later removed: its
+`FetchUserInfo` trusted unverified provider tokens, issue #75.)
 
 This means a consumer using either path sees identical wire behavior. The
 rollback is functionally equivalent to keeping the donor as the runtime,

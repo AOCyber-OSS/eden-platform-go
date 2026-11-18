@@ -6,6 +6,7 @@ package config
 
 import (
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -67,6 +68,12 @@ type Config struct {
 	// Env: AOID_JWT_ACTIVE_KID.
 	JWTActiveKID string
 
+	// JWTRejectLegacyUntyped closes the issue-#80 migration window now:
+	// tokens minted before the token_use claim existed are refused even
+	// before auth.DefaultLegacyUntypedCutoff. Env:
+	// AOID_JWT_REJECT_LEGACY_UNTYPED ("true"/"1"). Default: false.
+	JWTRejectLegacyUntyped bool
+
 	// AccessTokenExpiry is the lifetime of issued access tokens. Used by
 	// the issuer (objective 30); included here so config is immutable once
 	// the issuer activates. Env: AOID_ACCESS_TOKEN_EXPIRY (Go duration).
@@ -101,22 +108,23 @@ type Config struct {
 // AOID_LOG_LEVEL doesn't take the service down.
 func Load() *Config {
 	c := &Config{
-		ListenAddr:         envOr("AOID_LISTEN_ADDR", ":8090"),
-		Issuer:             envOr("AOID_ISSUER", "http://localhost:8090"),
-		Environment:        envOr("AOID_ENV", "dev"),
-		LogLevel:           envOr("AOID_LOG_LEVEL", "info"),
-		LogFormat:          envOr("AOID_LOG_FORMAT", "text"),
-		SentryDSN:          os.Getenv("AOID_SENTRY_DSN"),
-		Release:            envOr("AOID_RELEASE", "dev"),
-		DatabaseURL:        firstNonEmpty(os.Getenv("AOID_DATABASE_URL"), os.Getenv("DATABASE_URL")),
-		JWTKeySeedPath:     os.Getenv("AOID_JWT_KEY_SEED_PATH"),
-		JWTKeySeedPaths:    parseSeedPaths(os.Getenv("AOID_JWT_KEY_SEED_PATHS")),
-		JWTActiveKID:       os.Getenv("AOID_JWT_ACTIVE_KID"),
-		AccessTokenExpiry:  parseDuration(os.Getenv("AOID_ACCESS_TOKEN_EXPIRY"), 15*time.Minute),
-		RefreshTokenExpiry: parseDuration(os.Getenv("AOID_REFRESH_TOKEN_EXPIRY"), 7*24*time.Hour),
-		ShutdownTimeout:    parseDuration(os.Getenv("AOID_SHUTDOWN_TIMEOUT"), 5*time.Second),
-		AODexClientSecret:  os.Getenv("AOID_AODEX_CLIENT_SECRET"),
-		AODexRedirectURIs:  parseCSV(os.Getenv("AOID_AODEX_REDIRECT_URIS")),
+		ListenAddr:             envOr("AOID_LISTEN_ADDR", ":8090"),
+		Issuer:                 envOr("AOID_ISSUER", "http://localhost:8090"),
+		Environment:            envOr("AOID_ENV", "dev"),
+		LogLevel:               envOr("AOID_LOG_LEVEL", "info"),
+		LogFormat:              envOr("AOID_LOG_FORMAT", "text"),
+		SentryDSN:              os.Getenv("AOID_SENTRY_DSN"),
+		Release:                envOr("AOID_RELEASE", "dev"),
+		DatabaseURL:            firstNonEmpty(os.Getenv("AOID_DATABASE_URL"), os.Getenv("DATABASE_URL")),
+		JWTKeySeedPath:         os.Getenv("AOID_JWT_KEY_SEED_PATH"),
+		JWTKeySeedPaths:        parseSeedPaths(os.Getenv("AOID_JWT_KEY_SEED_PATHS")),
+		JWTActiveKID:           os.Getenv("AOID_JWT_ACTIVE_KID"),
+		JWTRejectLegacyUntyped: parseBool(os.Getenv("AOID_JWT_REJECT_LEGACY_UNTYPED")),
+		AccessTokenExpiry:      parseDuration(os.Getenv("AOID_ACCESS_TOKEN_EXPIRY"), 15*time.Minute),
+		RefreshTokenExpiry:     parseDuration(os.Getenv("AOID_REFRESH_TOKEN_EXPIRY"), 7*24*time.Hour),
+		ShutdownTimeout:        parseDuration(os.Getenv("AOID_SHUTDOWN_TIMEOUT"), 5*time.Second),
+		AODexClientSecret:      os.Getenv("AOID_AODEX_CLIENT_SECRET"),
+		AODexRedirectURIs:      parseCSV(os.Getenv("AOID_AODEX_REDIRECT_URIS")),
 	}
 	if c.AODexClientSecret == "" && c.Environment != "production" {
 		c.AODexClientSecret = "dev-aodex-client-secret-do-not-use-in-prod"
@@ -127,6 +135,13 @@ func Load() *Config {
 		}
 	}
 	return c
+}
+
+// parseBool reports whether raw is a true value ("true", "1", ...). Anything
+// unparseable is false.
+func parseBool(raw string) bool {
+	v, err := strconv.ParseBool(strings.TrimSpace(raw))
+	return err == nil && v
 }
 
 // parseCSV splits a comma-separated string into a trimmed, non-empty

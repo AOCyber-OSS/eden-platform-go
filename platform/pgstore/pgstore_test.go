@@ -3,6 +3,7 @@ package pgstore_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"os"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"go.aocyber.ai/eden-platform-go/platform/company"
 	"go.aocyber.ai/eden-platform-go/platform/pgstore"
 	"go.aocyber.ai/eden-platform-go/platform/rbac"
+	"go.aocyber.ai/eden-platform-go/platform/webhook"
 )
 
 func setupTestBackend(t *testing.T) *pgstore.Backend {
@@ -528,7 +530,7 @@ func TestWebhookStore_CRUD(t *testing.T) {
 	}
 
 	// Delete
-	err = store.DeleteWebhook(ctx, wh.ID)
+	err = store.DeleteWebhook(ctx, c.ID, wh.ID)
 	if err != nil {
 		t.Fatalf("delete webhook: %v", err)
 	}
@@ -568,12 +570,64 @@ func TestWebhookStore_Deliveries(t *testing.T) {
 	// so it won't appear in GetPendingDeliveries (which checks next_retry_at <= now())
 
 	// List deliveries by webhook
-	deliveries, err := store.ListDeliveriesByWebhook(ctx, wh.ID, 10, 0)
+	deliveries, err := store.ListDeliveriesByWebhook(ctx, c.ID, wh.ID, 10, 0)
 	if err != nil {
 		t.Fatalf("list deliveries: %v", err)
 	}
 	if len(deliveries) != 1 {
 		t.Errorf("delivery count = %d, want 1", len(deliveries))
+	}
+}
+
+// TestWebhookStore_TenantScoped pins #77 at the SQL layer: another
+// company's id deletes nothing (ErrWebhookNotFound) and lists nothing.
+func TestWebhookStore_TenantScoped(t *testing.T) {
+	backend := setupTestBackend(t)
+	store := backend.WebhookStore()
+	companyStore := backend.CompanyStore()
+	ctx := context.Background()
+
+	a, err := companyStore.CreateCompany(ctx, company.Company{Name: "Tenant A", Slug: "tenant-a"})
+	if err != nil {
+		t.Fatalf("create company a: %v", err)
+	}
+	b, err := companyStore.CreateCompany(ctx, company.Company{Name: "Tenant B", Slug: "tenant-b"})
+	if err != nil {
+		t.Fatalf("create company b: %v", err)
+	}
+	wh, err := store.CreateWebhook(ctx, a.ID, "https://a.example.com/hook", "secret-a", []string{"*"})
+	if err != nil {
+		t.Fatalf("create webhook: %v", err)
+	}
+	if _, err := store.CreateDelivery(ctx, wh.ID, "user.created", `{"pii":"a"}`); err != nil {
+		t.Fatalf("create delivery: %v", err)
+	}
+
+	// Wrong tenant: list returns nothing, delete is a no-op + not found.
+	got, err := store.ListDeliveriesByWebhook(ctx, b.ID, wh.ID, 10, 0)
+	if err != nil {
+		t.Fatalf("wrong-tenant list: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("wrong-tenant list returned %d deliveries, want 0", len(got))
+	}
+	if err := store.DeleteWebhook(ctx, b.ID, wh.ID); !errors.Is(err, webhook.ErrWebhookNotFound) {
+		t.Fatalf("wrong-tenant delete = %v, want ErrWebhookNotFound", err)
+	}
+	if _, err := store.GetWebhook(ctx, wh.ID); err != nil {
+		t.Fatalf("wrong-tenant delete removed the webhook: %v", err)
+	}
+
+	// Right tenant: list sees the delivery, delete removes it once.
+	got, err = store.ListDeliveriesByWebhook(ctx, a.ID, wh.ID, 10, 0)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("same-tenant list = %d rows, %v; want 1", len(got), err)
+	}
+	if err := store.DeleteWebhook(ctx, a.ID, wh.ID); err != nil {
+		t.Fatalf("same-tenant delete: %v", err)
+	}
+	if err := store.DeleteWebhook(ctx, a.ID, wh.ID); !errors.Is(err, webhook.ErrWebhookNotFound) {
+		t.Fatalf("second delete = %v, want ErrWebhookNotFound", err)
 	}
 }
 

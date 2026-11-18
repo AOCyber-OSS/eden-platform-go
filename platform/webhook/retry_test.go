@@ -13,6 +13,11 @@ import (
 	"github.com/google/uuid"
 )
 
+// localReceiver opts the httptest receivers (http://127.0.0.1:port) out of
+// the webhook egress policy. Only these delivery-mechanics tests use it; the
+// policy itself is covered by ssrf_test.go with the default service.
+var localReceiver = webhook.WithInsecureTargets("127.0.0.1")
+
 // memStore is an in-memory WebhookStore for tests.
 type memStore struct {
 	mu         sync.Mutex
@@ -79,9 +84,12 @@ func (s *memStore) UpdateWebhookStatus(_ context.Context, id uuid.UUID, active b
 	return nil
 }
 
-func (s *memStore) DeleteWebhook(_ context.Context, id uuid.UUID) error {
+func (s *memStore) DeleteWebhook(_ context.Context, companyID, id uuid.UUID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if wh, ok := s.hooks[id]; !ok || wh.CompanyID != companyID {
+		return webhook.ErrWebhookNotFound
+	}
 	delete(s.hooks, id)
 	return nil
 }
@@ -210,7 +218,7 @@ func Test_ExponentialBackoff_NextRetrySchedule(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	svc := webhook.NewService(store, webhook.WithMaxRetries(3))
+	svc := webhook.NewService(store, localReceiver, webhook.WithMaxRetries(3))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -297,7 +305,7 @@ func Test_AutoPauseAfterConsecutiveFailures(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	svc := webhook.NewService(store,
+	svc := webhook.NewService(store, localReceiver,
 		webhook.WithMaxRetries(1),               // each Trigger gives one attempt
 		webhook.WithMaxConsecutiveFailures(3),   // pause after 3
 	)
@@ -336,7 +344,7 @@ func Test_RetryFailedDeliveries_ReEnqueuesActiveOnly(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	svc := webhook.NewService(store, webhook.WithMaxRetries(5))
+	svc := webhook.NewService(store, localReceiver, webhook.WithMaxRetries(5))
 	ctx := context.Background()
 
 	companyID := uuid.New()
@@ -371,7 +379,7 @@ func Test_RetryFailedDeliveries_ReEnqueuesActiveOnly(t *testing.T) {
 // Test_RetryFailedDeliveries_NoFailedRows is a no-op when nothing to retry.
 func Test_RetryFailedDeliveries_NoFailedRows(t *testing.T) {
 	store := newMemStore()
-	svc := webhook.NewService(store)
+	svc := webhook.NewService(store, localReceiver)
 
 	retried, err := svc.RetryFailedDeliveries(context.Background())
 	if err != nil {
@@ -391,7 +399,7 @@ func Test_ExecuteDelivery_Success(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	svc := webhook.NewService(store)
+	svc := webhook.NewService(store, localReceiver)
 	ctx := context.Background()
 
 	companyID := uuid.New()
@@ -417,7 +425,7 @@ func Test_ExecuteDelivery_Success(t *testing.T) {
 func Test_Service_Options_Applied(t *testing.T) {
 	store := newMemStore()
 	custom := &http.Client{Timeout: 7 * time.Second}
-	svc := webhook.NewService(store,
+	svc := webhook.NewService(store, localReceiver,
 		webhook.WithHTTPClient(custom),
 		webhook.WithHTTPTimeout(2*time.Second),
 		webhook.WithMaxRetries(99),

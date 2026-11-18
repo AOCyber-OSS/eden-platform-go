@@ -13,6 +13,19 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const consumeRefreshToken = `-- name: ConsumeRefreshToken :execrows
+UPDATE refresh_tokens SET revoked = true
+WHERE token_hash = $1 AND revoked = false AND expires_at > now()
+`
+
+func (q *Queries) ConsumeRefreshToken(ctx context.Context, tokenHash string) (int64, error) {
+	result, err := q.db.Exec(ctx, consumeRefreshToken, tokenHash)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const createRefreshToken = `-- name: CreateRefreshToken :exec
 INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
 VALUES ($1, $2, $3)

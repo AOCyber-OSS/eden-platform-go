@@ -27,6 +27,9 @@ var (
 	ErrUnsupportedFlow = errors.New("federation: unsupported flow for this provider")
 	// ErrFederationUserNotFound — JIT disabled and user not found.
 	ErrFederationUserNotFound = errors.New("federation: user not found and JIT disabled")
+	// ErrFederationEmailNotMember — the asserted email belongs to an
+	// existing account that is not a member of the asserting tenant (#74).
+	ErrFederationEmailNotMember = errors.New("federation: email belongs to an account that is not a member of this tenant")
 )
 
 // Provider identifies the external-IdP protocol family.

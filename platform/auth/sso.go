@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -48,6 +49,10 @@ type SSOService struct {
 	// handoffStore backs the ?code= callback contract (AOID obj-50 SDK-08 / D6):
 	// the token pair is parked here and the redirect carries only a reference.
 	handoffStore HandoffStore
+
+	// egress is the outbound policy for every tenant-controlled fetch
+	// (OIDC discovery/JWKS/token, SAML metadata); see sso_egress.go (#85).
+	egress *ssoEgress
 }
 
 // SetHandoffStore replaces the per-process handoff store.
@@ -74,6 +79,7 @@ func NewSSOService(store AuthStore, jwtManager *JWTManager, baseURL string) *SSO
 		baseURL:       strings.TrimRight(baseURL, "/"),
 		oidcProviders: make(map[string]*oidcCachedProvider),
 		handoffStore:  NewInMemoryHandoffStore(),
+		egress:        defaultSSOEgress(),
 	}
 	svc.callback = svc.HandleOIDCCallbackWithState
 
@@ -253,7 +259,9 @@ func (s *SSOService) HandleOIDCCallbackWithVerifier(ctx context.Context, code, p
 	if verifier != "" {
 		exchangeOpts = append(exchangeOpts, oauth2.VerifierOption(verifier))
 	}
-	oauth2Token, err := cached.config.Exchange(ctx, code, exchangeOpts...)
+	// The token endpoint comes from the tenant-controlled discovery
+	// document, so the exchange goes through the egress policy too (#85).
+	oauth2Token, err := cached.config.Exchange(gooidc.ClientContext(ctx, s.egress.client), code, exchangeOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("exchange authorization code: %w", err)
 	}
@@ -284,7 +292,7 @@ func (s *SSOService) HandleOIDCCallbackWithVerifier(ctx context.Context, code, p
 		return nil, fmt.Errorf("email claim not found in ID token")
 	}
 
-	authResp, err := s.jitProvision(ctx, claims.Email, claims.Name, companyID)
+	authResp, err := s.jitProvision(ctx, claims.Email, claims.Name, companyID, provider)
 	if err != nil {
 		return nil, err
 	}
@@ -312,7 +320,7 @@ func (s *SSOService) InitiateSAML(ctx context.Context, companyID uuid.UUID) (str
 		return "", fmt.Errorf("SAML not configured for this company")
 	}
 
-	sp, err := s.createSAMLSP(ssoConfig)
+	sp, err := s.createSAMLSP(ctx, ssoConfig)
 	if err != nil {
 		return "", fmt.Errorf("create SAML SP: %w", err)
 	}
@@ -338,7 +346,7 @@ func (s *SSOService) HandleSAMLCallback(r *http.Request, companyID uuid.UUID) (*
 		return nil, fmt.Errorf("SAML not configured for this company")
 	}
 
-	sp, err := s.createSAMLSP(ssoConfig)
+	sp, err := s.createSAMLSP(r.Context(), ssoConfig)
 	if err != nil {
 		return nil, fmt.Errorf("create SAML SP: %w", err)
 	}
@@ -356,7 +364,7 @@ func (s *SSOService) HandleSAMLCallback(r *http.Request, companyID uuid.UUID) (*
 		return nil, fmt.Errorf("email attribute not found in SAML assertion")
 	}
 
-	return s.jitProvision(r.Context(), email, name, companyID)
+	return s.jitProvision(r.Context(), email, name, companyID, "saml")
 }
 
 // RegisterHTTPHandlers registers SSO callback HTTP handlers on the given mux.
@@ -388,7 +396,7 @@ func (s *SSOService) handleOIDCCallbackHTTP(w http.ResponseWriter, r *http.Reque
 	resp, redirectURI, err := s.callback(r.Context(), code, stateJWT)
 	if err != nil {
 		slog.Error("OIDC callback failed", "error", err)
-		http.Error(w, "authentication failed", http.StatusInternalServerError)
+		http.Error(w, "authentication failed", ssoFailureStatus(err))
 		return
 	}
 
@@ -429,6 +437,15 @@ func (s *SSOService) handleOIDCCallbackHTTP(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	fmt.Fprintf(w, `{"access_token":"%s","refresh_token":"%s"}`, resp.AccessToken, resp.RefreshToken)
+}
+
+// ssoFailureStatus maps an SSO completion error to its HTTP status: a refused
+// login is 403, anything else stays 500. The body is the same either way.
+func ssoFailureStatus(err error) int {
+	if errors.Is(err, ErrSSOEmailNotMember) {
+		return http.StatusForbidden
+	}
+	return http.StatusInternalServerError
 }
 
 // appendSSOQuery appends key=value to a URL, choosing ? or & based on whether
@@ -508,7 +525,7 @@ func (s *SSOService) handleSAMLACSHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.HandleSAMLCallback(r, companyID)
 	if err != nil {
 		slog.Error("SAML ACS callback failed", "error", err)
-		http.Error(w, "authentication failed", http.StatusInternalServerError)
+		http.Error(w, "authentication failed", ssoFailureStatus(err))
 		return
 	}
 
@@ -536,43 +553,114 @@ func (s *SSOService) handleSAMLMetadataHTTP(w http.ResponseWriter, r *http.Reque
 	fmt.Fprint(w, metadata)
 }
 
-// jitProvision performs Just-In-Time user provisioning for SSO.
-// If a user with the email exists, link them to the company. Otherwise, create a new user.
-func (s *SSOService) jitProvision(ctx context.Context, email, name string, companyID uuid.UUID) (*AuthResponse, error) {
+// ErrSSOEmailNotMember is returned when an SSO login asserts the email of an
+// existing account that is not a member of the company whose IdP made the
+// assertion. The login is refused: no membership is created and no token is
+// issued (#74).
+var ErrSSOEmailNotMember = errors.New("auth: SSO email belongs to an account that is not a member of this company")
+
+// jitProvision resolves an SSO login to a user of companyID and issues tokens.
+//
+// A company's SSOConfig (its IdP) is trusted to vouch for that company's
+// people, never for anyone else's. The email in the assertion therefore only
+// selects an account; it does not authorize joining the company:
+//
+//   - email matches an existing MEMBER of companyID: sign them in with their
+//     existing role.
+//   - email matches an existing account that is NOT a member of companyID:
+//     refuse with ErrSSOEmailNotMember. The account may belong to another
+//     tenant, and that tenant's IdP is the only one allowed to speak for it.
+//     Joining this company takes an explicit membership (an invite), never an
+//     email match.
+//   - email matches no account: create one and make it a member of companyID.
+//     No other tenant has a claim on an address with no account.
+func (s *SSOService) jitProvision(ctx context.Context, email, name string, companyID uuid.UUID, provider string) (*AuthResponse, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	if name == "" {
 		name = strings.Split(email, "@")[0]
 	}
 
-	// Try to find existing user
-	user, err := s.store.GetUserByEmail(ctx, email)
+	if user, err := s.store.GetUserByEmail(ctx, email); err == nil {
+		return s.signInExistingSSOUser(ctx, user, companyID, provider, email)
+	}
+
+	// No account for this email: create one (no password for SSO users) and
+	// make it a member of the asserting company.
+	user, err := s.createSSOUser(ctx, email, name, companyID)
 	if err != nil {
-		// User not found -- create new user (no password for SSO users)
-		user, err = s.store.CreateUser(ctx, email, "", name)
-		if err != nil {
-			return nil, fmt.Errorf("create SSO user: %w", err)
+		// A concurrent first login may have created the account between the
+		// lookup and this insert (unique email). Resolve the winner under the
+		// same member-or-refuse rule instead of failing with a 500.
+		if existing, lookupErr := s.store.GetUserByEmail(ctx, email); lookupErr == nil {
+			return s.signInExistingSSOUser(ctx, existing, companyID, provider, email)
 		}
+		return nil, fmt.Errorf("create SSO user: %w", err)
 	}
+	roleName, roleLevel := "member", 40
+	if role, err := s.store.GetUserRole(ctx, companyID, user.ID); err == nil {
+		roleName, roleLevel = role.Name, role.RoleLevel
+	}
+	return s.issueSSOTokens(ctx, user, companyID, roleName, roleLevel)
+}
 
-	// Ensure company membership exists (try create, ignore duplicate)
-	_ = s.store.CreateCompanyMembership(ctx, companyID, user.ID, rbac.MemberRoleID)
+// createSSOUser creates a passwordless SSO user and their member-role
+// membership in companyID. When the store is transactional (pgstore and
+// devstore both are), the two writes commit together, so a failed membership
+// never strands a user row that the refuse rule would lock out for good.
+// A non-transactional AuthStore has no delete-user primitive to compensate
+// with, so it keeps the two sequential writes and reports the error.
+func (s *SSOService) createSSOUser(ctx context.Context, email, name string, companyID uuid.UUID) (User, error) {
+	if txStore, ok := s.store.(TxAuthStore); ok {
+		return createUserWithMembership(ctx, txStore, email, "", name, companyID, rbac.MemberRoleID)
+	}
+	user, err := s.store.CreateUser(ctx, email, "", name)
+	if err != nil {
+		return User{}, err
+	}
+	if err := s.store.CreateCompanyMembership(ctx, companyID, user.ID, rbac.MemberRoleID); err != nil {
+		return User{}, fmt.Errorf("create SSO company membership: %w", err)
+	}
+	return user, nil
+}
 
-	// Get role for token
+// signInExistingSSOUser signs in an existing account that is a member of
+// companyID, and refuses (audited) one that is not.
+func (s *SSOService) signInExistingSSOUser(ctx context.Context, user User, companyID uuid.UUID, provider, email string) (*AuthResponse, error) {
 	role, err := s.store.GetUserRole(ctx, companyID, user.ID)
-	roleName := "member"
-	roleLevel := 40
-	if err == nil {
-		roleName = role.Name
-		roleLevel = role.RoleLevel
+	if err != nil {
+		s.auditSSORefusal(ctx, companyID, provider, email)
+		return nil, ErrSSOEmailNotMember
 	}
+	return s.issueSSOTokens(ctx, user, companyID, role.Name, role.RoleLevel)
+}
 
+// auditSSORefusal records a refused login against the asserting company. The
+// row has no actor (nobody signed in) and deliberately omits the matched
+// account's id: that account may belong to another tenant, and this audit log
+// is the asserting tenant's. The email, which the asserting IdP already knows,
+// goes to the operator log only.
+func (s *SSOService) auditSSORefusal(ctx context.Context, companyID uuid.UUID, provider, email string) {
+	slog.Warn("SSO login refused: email belongs to an account that is not a member of the asserting company",
+		"company_id", companyID, "provider", provider, "email", email)
+	details, _ := json.Marshal(map[string]string{
+		"reason":   "email_not_member",
+		"provider": provider,
+	})
+	if err := s.store.CreateAuditLog(ctx, companyID, uuid.Nil, "auth.sso.login_refused", "sso_config", provider, "", details); err != nil {
+		slog.Warn("audit SSO refusal failed", "company_id", companyID, "error", err)
+	}
+}
+
+// issueSSOTokens mints the access/refresh pair for a user of companyID and
+// stores the refresh token.
+func (s *SSOService) issueSSOTokens(ctx context.Context, user User, companyID uuid.UUID, roleName string, roleLevel int) (*AuthResponse, error) {
 	companyIDStr := companyID.String()
 	accessToken, err := s.jwtManager.CreateAccessToken(user.ID.String(), companyIDStr, roleName, roleLevel, []string{companyIDStr})
 	if err != nil {
 		return nil, fmt.Errorf("create access token: %w", err)
 	}
 
-	refreshToken, err := s.jwtManager.CreateRefreshToken(user.ID.String())
+	refreshToken, err := s.jwtManager.CreateCompanyRefreshToken(user.ID.String(), companyIDStr)
 	if err != nil {
 		return nil, fmt.Errorf("create refresh token: %w", err)
 	}
@@ -615,7 +703,13 @@ func (s *SSOService) getOrCreateOIDCProvider(ctx context.Context, cfg SSOConfig)
 		}
 	}
 
-	provider, err := gooidc.NewProvider(ctx, issuerURL)
+	// issuerURL is tenant-controlled: check it before any DNS, then discover
+	// through the guarded client. go-oidc keeps that client for the JWKS
+	// fetches of this provider as well (#85).
+	if _, err := s.egress.checkRawURL(issuerURL); err != nil {
+		return nil, fmt.Errorf("OIDC issuer URL: %w", err)
+	}
+	provider, err := gooidc.NewProvider(gooidc.ClientContext(ctx, s.egress.client), issuerURL)
 	if err != nil {
 		return nil, fmt.Errorf("discover OIDC provider at %s: %w", issuerURL, err)
 	}
@@ -637,14 +731,16 @@ func (s *SSOService) getOrCreateOIDCProvider(ctx context.Context, cfg SSOConfig)
 	return cached, nil
 }
 
-func (s *SSOService) createSAMLSP(cfg SSOConfig) (*saml.ServiceProvider, error) {
+func (s *SSOService) createSAMLSP(ctx context.Context, cfg SSOConfig) (*saml.ServiceProvider, error) {
 	if cfg.MetadataURL == "" {
 		return nil, fmt.Errorf("SAML metadata URL not configured")
 	}
 
-	metadataURL, err := url.Parse(cfg.MetadataURL)
+	// MetadataURL is tenant-controlled: check it before any DNS, then fetch
+	// through the guarded client (#85).
+	metadataURL, err := s.egress.checkRawURL(cfg.MetadataURL)
 	if err != nil {
-		return nil, fmt.Errorf("parse metadata URL: %w", err)
+		return nil, fmt.Errorf("SAML metadata URL: %w", err)
 	}
 
 	rootURL, err := url.Parse(s.baseURL)
@@ -652,7 +748,7 @@ func (s *SSOService) createSAMLSP(cfg SSOConfig) (*saml.ServiceProvider, error) 
 		return nil, fmt.Errorf("parse base URL: %w", err)
 	}
 
-	idpMetadata, err := samlsp.FetchMetadata(context.Background(), http.DefaultClient, *metadataURL)
+	idpMetadata, err := samlsp.FetchMetadata(ctx, s.egress.client, *metadataURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetch IdP metadata: %w", err)
 	}

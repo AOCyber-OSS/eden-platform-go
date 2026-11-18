@@ -131,7 +131,9 @@ func (i *Issuer) handleRefreshGrant(w http.ResponseWriter, r *http.Request, clie
 		writeTokenError(w, http.StatusBadRequest, "invalid_request", "refresh_token required")
 		return
 	}
-	authResp, err := i.Auth.RefreshToken(r.Context(), rt)
+	// Bound to the authenticated client (issue #80): a refresh token issued to
+	// another client is invalid_grant, and the rotated token stays bound.
+	authResp, err := i.Auth.RefreshTokenForClient(r.Context(), rt, client.ID)
 	if err != nil {
 		writeTokenError(w, http.StatusBadRequest, "invalid_grant", "invalid or already-used refresh_token")
 		return
@@ -174,7 +176,7 @@ func (i *Issuer) mintTokens(user auth.User, clientID, nonce string, scope []stri
 	if err != nil {
 		return tokenBundle{}, fmt.Errorf("create access token: %w", err)
 	}
-	rt, err := i.JWT.CreateRefreshToken(user.ID.String())
+	rt, err := i.JWT.CreateClientRefreshToken(user.ID.String(), clientID)
 	if err != nil {
 		return tokenBundle{}, fmt.Errorf("create refresh token: %w", err)
 	}
@@ -195,6 +197,9 @@ func (i *Issuer) mintTokens(user auth.User, clientID, nonce string, scope []stri
 // IDTokenClaims is the OIDC ID token claim set.
 type IDTokenClaims struct {
 	jwt.RegisteredClaims
+	// TokenUse is always auth.TokenUseID (issue #80): the ID token shares the
+	// access-token key, and no platform validator accepts this value.
+	TokenUse          string `json:"token_use"`
 	AuthTime          int64  `json:"auth_time,omitempty"`
 	Nonce             string `json:"nonce,omitempty"`
 	Email             string `json:"email,omitempty"`
@@ -217,6 +222,7 @@ func (i *Issuer) signIDToken(user auth.User, audience, nonce string, scope []str
 			NotBefore: jwt.NewNumericDate(now),
 			ID:        randomID(),
 		},
+		TokenUse: auth.TokenUseID,
 		AuthTime: now.Unix(),
 		Nonce:    nonce,
 	}
