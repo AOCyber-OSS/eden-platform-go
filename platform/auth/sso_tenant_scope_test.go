@@ -151,13 +151,16 @@ func (w *ssoTenantWorld) addTenant(name, slug string) tenant {
 		w.t.Fatalf("CreateCompany(%s): %v", slug, err)
 	}
 	op := newFakePKCEOP(w.t, tenantScopeClientID, "", "")
+	// Each tenant's IdP may JIT-provision its own domain only (#89).
 	if err := w.store.UpsertSSOConfig(ctx, auth.SSOConfig{
-		CompanyID:    id,
-		Provider:     "oidc",
-		IssuerURL:    op.srv.URL,
-		ClientID:     tenantScopeClientID,
-		ClientSecret: "test-client-secret",
-		IsActive:     true,
+		CompanyID:            id,
+		Provider:             "oidc",
+		IssuerURL:            op.srv.URL,
+		ClientID:             tenantScopeClientID,
+		ClientSecret:         "test-client-secret",
+		IsActive:             true,
+		JITEnabled:           true,
+		EmailDomainAllowlist: []string{slug + ".example"},
 	}); err != nil {
 		w.t.Fatalf("UpsertSSOConfig(%s): %v", slug, err)
 	}
@@ -409,8 +412,8 @@ func TestSSOTenantScope_RefusalIsAudited(t *testing.T) {
 	if a.ActorID != uuid.Nil {
 		t.Errorf("audit actor = %s, want none (uuid.Nil): nobody signed in", a.ActorID)
 	}
-	if a.Details["reason"] != "email_not_member" || a.Details["provider"] != "oidc" {
-		t.Errorf("audit details = %v, want reason=email_not_member provider=oidc", a.Details)
+	if a.Details["reason"] != "login_refused" || a.Details["provider"] != "oidc" {
+		t.Errorf("audit details = %v, want reason=login_refused provider=oidc", a.Details)
 	}
 	for k, v := range a.Details {
 		if s, ok := v.(string); ok && s == victim.ID.String() {
@@ -451,7 +454,7 @@ func TestSSOTenantScope_CreateRaceResolvesUnderTheSameRule(t *testing.T) {
 			if tc.inTenantA {
 				target = w.A.ID
 			}
-			u := w.member(target, "racer@example.test", rbac.MemberRoleID)
+			u := w.member(target, "racer@tenant-a.example", rbac.MemberRoleID)
 			w.svc = auth.NewSSOService(&raceOnceStore{recordingStore: w.store}, w.jwt, "https://api.example.test")
 			allowLoopbackIdPForTest(w.svc)
 			w.mux = http.NewServeMux()

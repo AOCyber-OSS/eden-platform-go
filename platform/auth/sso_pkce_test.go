@@ -238,6 +238,9 @@ func newSSOTestService(t *testing.T, op *fakePKCEOP, clientID string) (*auth.SSO
 		// the SSOService always supplies one (confidential client mode).
 		ClientSecret: "test-client-secret",
 		IsActive:     true,
+		// These tests JIT-provision first logins; the policy must allow it (#89).
+		JITEnabled:           true,
+		EmailDomainAllowlist: []string{"aocyber.ai", "example.com"},
 	}); err != nil {
 		t.Fatalf("UpsertSSOConfig: %v", err)
 	}

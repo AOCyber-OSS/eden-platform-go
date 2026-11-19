@@ -292,7 +292,7 @@ func (s *SSOService) HandleOIDCCallbackWithVerifier(ctx context.Context, code, p
 		return nil, fmt.Errorf("email claim not found in ID token")
 	}
 
-	authResp, err := s.jitProvision(ctx, claims.Email, claims.Name, companyID, provider)
+	authResp, err := s.jitProvision(ctx, claims.Email, claims.Name, ssoConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -364,7 +364,7 @@ func (s *SSOService) HandleSAMLCallback(r *http.Request, companyID uuid.UUID) (*
 		return nil, fmt.Errorf("email attribute not found in SAML assertion")
 	}
 
-	return s.jitProvision(r.Context(), email, name, companyID, "saml")
+	return s.jitProvision(r.Context(), email, name, ssoConfig)
 }
 
 // RegisterHTTPHandlers registers SSO callback HTTP handlers on the given mux.
@@ -442,7 +442,7 @@ func (s *SSOService) handleOIDCCallbackHTTP(w http.ResponseWriter, r *http.Reque
 // ssoFailureStatus maps an SSO completion error to its HTTP status: a refused
 // login is 403, anything else stays 500. The body is the same either way.
 func ssoFailureStatus(err error) int {
-	if errors.Is(err, ErrSSOEmailNotMember) {
+	if errors.Is(err, ErrSSOLoginRefused) {
 		return http.StatusForbidden
 	}
 	return http.StatusInternalServerError
@@ -553,11 +553,22 @@ func (s *SSOService) handleSAMLMetadataHTTP(w http.ResponseWriter, r *http.Reque
 	fmt.Fprint(w, metadata)
 }
 
-// ErrSSOEmailNotMember is returned when an SSO login asserts the email of an
-// existing account that is not a member of the company whose IdP made the
-// assertion. The login is refused: no membership is created and no token is
-// issued (#74).
-var ErrSSOEmailNotMember = errors.New("auth: SSO email belongs to an account that is not a member of this company")
+// ErrSSOLoginRefused is returned for every SSO login the asserting company's
+// policy refuses: the email belongs to an account that is not a member of
+// that company (#74), or no account exists and the company's SSOConfig does
+// not allow JIT provisioning for it (#89). No account or membership is
+// created and no token is issued.
+//
+// The reasons deliberately share one error, one HTTP response and one audit
+// record, so the asserting IdP cannot tell "has an account elsewhere" from
+// "not provisionable here". The specific reason goes to the operator log only.
+var ErrSSOLoginRefused = errors.New("auth: SSO login refused")
+
+// ErrSSOEmailNotMember is the #74 name for ErrSSOLoginRefused and is the same
+// error value.
+//
+// Deprecated: use ErrSSOLoginRefused.
+var ErrSSOEmailNotMember = ErrSSOLoginRefused
 
 // jitProvision resolves an SSO login to a user of companyID and issues tokens.
 //
@@ -572,9 +583,13 @@ var ErrSSOEmailNotMember = errors.New("auth: SSO email belongs to an account tha
 //     tenant, and that tenant's IdP is the only one allowed to speak for it.
 //     Joining this company takes an explicit membership (an invite), never an
 //     email match.
-//   - email matches no account: create one and make it a member of companyID.
-//     No other tenant has a claim on an address with no account.
-func (s *SSOService) jitProvision(ctx context.Context, email, name string, companyID uuid.UUID, provider string) (*AuthResponse, error) {
+//   - email matches no account: create one and make it a member of companyID,
+//     but only when cfg allows JIT for it (JITEnabled and the email's domain
+//     is in EmailDomainAllowlist; see jitAllowed). Otherwise refuse (#89).
+//
+// Every refusal returns ErrSSOLoginRefused with the same audit record.
+func (s *SSOService) jitProvision(ctx context.Context, email, name string, cfg SSOConfig) (*AuthResponse, error) {
+	companyID, provider := cfg.CompanyID, cfg.Provider
 	email = strings.ToLower(strings.TrimSpace(email))
 	if name == "" {
 		name = strings.Split(email, "@")[0]
@@ -582,6 +597,11 @@ func (s *SSOService) jitProvision(ctx context.Context, email, name string, compa
 
 	if user, err := s.store.GetUserByEmail(ctx, email); err == nil {
 		return s.signInExistingSSOUser(ctx, user, companyID, provider, email)
+	}
+
+	if reason := jitRefusal(cfg, email); reason != "" {
+		s.auditSSORefusal(ctx, companyID, provider, email, reason)
+		return nil, ErrSSOLoginRefused
 	}
 
 	// No account for this email: create one (no password for SSO users) and
@@ -628,22 +648,45 @@ func (s *SSOService) createSSOUser(ctx context.Context, email, name string, comp
 func (s *SSOService) signInExistingSSOUser(ctx context.Context, user User, companyID uuid.UUID, provider, email string) (*AuthResponse, error) {
 	role, err := s.store.GetUserRole(ctx, companyID, user.ID)
 	if err != nil {
-		s.auditSSORefusal(ctx, companyID, provider, email)
-		return nil, ErrSSOEmailNotMember
+		s.auditSSORefusal(ctx, companyID, provider, email, "email_not_member")
+		return nil, ErrSSOLoginRefused
 	}
 	return s.issueSSOTokens(ctx, user, companyID, role.Name, role.RoleLevel)
+}
+
+// jitRefusal reports why cfg does not allow JIT-provisioning email, or ""
+// when it does. Policy (SSOConfig docs): JITEnabled must be true, and the
+// email's domain must equal an EmailDomainAllowlist entry, compared
+// case-insensitively after trimming. An empty allowlist admits nothing, and
+// there is no subdomain wildcard: "example.com" does not admit
+// "eng.example.com". An email that is not exactly local@domain is refused.
+func jitRefusal(cfg SSOConfig, email string) string {
+	if !cfg.JITEnabled {
+		return "jit_disabled"
+	}
+	local, domain, ok := strings.Cut(email, "@")
+	if !ok || local == "" || domain == "" || strings.Contains(domain, "@") {
+		return "email_malformed"
+	}
+	for _, d := range cfg.EmailDomainAllowlist {
+		if strings.EqualFold(strings.TrimSpace(d), domain) {
+			return ""
+		}
+	}
+	return "email_domain_not_allowed"
 }
 
 // auditSSORefusal records a refused login against the asserting company. The
 // row has no actor (nobody signed in) and deliberately omits the matched
 // account's id: that account may belong to another tenant, and this audit log
-// is the asserting tenant's. The email, which the asserting IdP already knows,
-// goes to the operator log only.
-func (s *SSOService) auditSSORefusal(ctx context.Context, companyID uuid.UUID, provider, email string) {
-	slog.Warn("SSO login refused: email belongs to an account that is not a member of the asserting company",
-		"company_id", companyID, "provider", provider, "email", email)
+// is the asserting tenant's. The row is identical for every refusal reason,
+// because the tenant that reads it also controls the asserting IdP (#89). The
+// reason and the email go to the operator log only.
+func (s *SSOService) auditSSORefusal(ctx context.Context, companyID uuid.UUID, provider, email, reason string) {
+	slog.Warn("SSO login refused",
+		"company_id", companyID, "provider", provider, "email", email, "reason", reason)
 	details, _ := json.Marshal(map[string]string{
-		"reason":   "email_not_member",
+		"reason":   "login_refused",
 		"provider": provider,
 	})
 	if err := s.store.CreateAuditLog(ctx, companyID, uuid.Nil, "auth.sso.login_refused", "sso_config", provider, "", details); err != nil {
