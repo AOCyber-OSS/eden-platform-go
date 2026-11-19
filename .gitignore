@@ -38,8 +38,8 @@ Thumbs.db
 # DevFlow runtime state — these are session-local caches and skill markers,
 # never meant to be committed. Planning artifacts under .planning/objectives/
 # and .planning/quick/ ARE committed; only the dotfiles are ignored.
-/.planning/.awareness-cache.json
-/.planning/.skill-active
+/.aoforge/.awareness-cache.json
+/.aoforge/.skill-active
 
 # Never commit developer key material. A real EC P-256 private key lived at
 # dev/jwt/jwt_es256_private.pem and reached the public Go module proxy, where
