@@ -2,8 +2,9 @@
 // AuthnRequest construction, SP metadata generation, response parsing with
 // attribute mapping, and IdP certificate handling.
 //
-// The platform's higher-level auth.SSOService uses crewjam/saml directly for
-// full SAML SP flows; this package exposes lower-level primitives for callers
+// Response verification (Verifier, VerifyResponse) is built on
+// russellhaering/gosaml2 and is shared with the higher-level auth.SSOService;
+// this package also exposes lower-level primitives for callers
 // (and is the foundation for the IdP support added in objective 23 under the
 // saml/idp/ subpackage).
 package saml
