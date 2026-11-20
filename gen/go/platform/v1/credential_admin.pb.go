@@ -614,10 +614,15 @@ func (x *CredentialAdminServiceRevokeApiKeyResponse) GetApiKey() *ApiKey {
 }
 
 type CredentialAdminServiceRotateApiKeyRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	TenantId      string                 `protobuf:"bytes,1,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
-	ApiKeyId      string                 `protobuf:"bytes,2,opt,name=api_key_id,json=apiKeyId,proto3" json:"api_key_id,omitempty"`
-	Reason        string                 `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	TenantId string                 `protobuf:"bytes,1,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
+	ApiKeyId string                 `protobuf:"bytes,2,opt,name=api_key_id,json=apiKeyId,proto3" json:"api_key_id,omitempty"`
+	Reason   string                 `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
+	// Optional successor expiry. Unset: the predecessor's original lifetime
+	// (expires_at - issued_at) counted from the rotation, or no expiry when
+	// the predecessor had none. Set: must be more than 30 s in the future
+	// (the same rule as MintApiKey), else InvalidArgument.
+	ExpiresAt     *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -671,6 +676,13 @@ func (x *CredentialAdminServiceRotateApiKeyRequest) GetReason() string {
 		return x.Reason
 	}
 	return ""
+}
+
+func (x *CredentialAdminServiceRotateApiKeyRequest) GetExpiresAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ExpiresAt
+	}
+	return nil
 }
 
 type CredentialAdminServiceRotateApiKeyResponse struct {
@@ -1529,12 +1541,14 @@ const file_platform_v1_credential_admin_proto_rawDesc = "" +
 	"api_key_id\x18\x02 \x01(\tR\bapiKeyId\x12\x16\n" +
 	"\x06reason\x18\x03 \x01(\tR\x06reason\"Z\n" +
 	"*CredentialAdminServiceRevokeApiKeyResponse\x12,\n" +
-	"\aapi_key\x18\x01 \x01(\v2\x13.platform.v1.ApiKeyR\x06apiKey\"~\n" +
+	"\aapi_key\x18\x01 \x01(\v2\x13.platform.v1.ApiKeyR\x06apiKey\"\xb9\x01\n" +
 	")CredentialAdminServiceRotateApiKeyRequest\x12\x1b\n" +
 	"\ttenant_id\x18\x01 \x01(\tR\btenantId\x12\x1c\n" +
 	"\n" +
 	"api_key_id\x18\x02 \x01(\tR\bapiKeyId\x12\x16\n" +
-	"\x06reason\x18\x03 \x01(\tR\x06reason\"\xa2\x01\n" +
+	"\x06reason\x18\x03 \x01(\tR\x06reason\x129\n" +
+	"\n" +
+	"expires_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\"\xa2\x01\n" +
 	"*CredentialAdminServiceRotateApiKeyResponse\x12-\n" +
 	"\arevoked\x18\x01 \x01(\v2\x13.platform.v1.ApiKeyR\arevoked\x12,\n" +
 	"\aapi_key\x18\x02 \x01(\v2\x13.platform.v1.ApiKeyR\x06apiKey\x12\x17\n" +
@@ -1658,41 +1672,42 @@ var file_platform_v1_credential_admin_proto_depIdxs = []int32{
 	0,  // 6: platform.v1.CredentialAdminServiceListApiKeysResponse.api_keys:type_name -> platform.v1.ApiKey
 	0,  // 7: platform.v1.CredentialAdminServiceGetApiKeyResponse.api_key:type_name -> platform.v1.ApiKey
 	0,  // 8: platform.v1.CredentialAdminServiceRevokeApiKeyResponse.api_key:type_name -> platform.v1.ApiKey
-	0,  // 9: platform.v1.CredentialAdminServiceRotateApiKeyResponse.revoked:type_name -> platform.v1.ApiKey
-	0,  // 10: platform.v1.CredentialAdminServiceRotateApiKeyResponse.api_key:type_name -> platform.v1.ApiKey
-	13, // 11: platform.v1.IssueCertificateResponse.cert:type_name -> platform.v1.CertificateSummary
-	22, // 12: platform.v1.CertificateSummary.issued_at:type_name -> google.protobuf.Timestamp
-	22, // 13: platform.v1.CertificateSummary.expires_at:type_name -> google.protobuf.Timestamp
-	22, // 14: platform.v1.CertificateSummary.revoked_at:type_name -> google.protobuf.Timestamp
-	13, // 15: platform.v1.RenewCertificateResponse.cert:type_name -> platform.v1.CertificateSummary
-	13, // 16: platform.v1.RevokeCertificateResponse.cert:type_name -> platform.v1.CertificateSummary
-	13, // 17: platform.v1.GetCertificateResponse.cert:type_name -> platform.v1.CertificateSummary
-	13, // 18: platform.v1.ListCertificatesResponse.certs:type_name -> platform.v1.CertificateSummary
-	11, // 19: platform.v1.CredentialAdminService.IssueCertificate:input_type -> platform.v1.IssueCertificateRequest
-	14, // 20: platform.v1.CredentialAdminService.RenewCertificate:input_type -> platform.v1.RenewCertificateRequest
-	16, // 21: platform.v1.CredentialAdminService.RevokeCertificate:input_type -> platform.v1.RevokeCertificateRequest
-	18, // 22: platform.v1.CredentialAdminService.GetCertificate:input_type -> platform.v1.GetCertificateRequest
-	20, // 23: platform.v1.CredentialAdminService.ListCertificates:input_type -> platform.v1.ListCertificatesRequest
-	1,  // 24: platform.v1.CredentialAdminService.MintApiKey:input_type -> platform.v1.CredentialAdminServiceMintApiKeyRequest
-	3,  // 25: platform.v1.CredentialAdminService.ListApiKeys:input_type -> platform.v1.CredentialAdminServiceListApiKeysRequest
-	5,  // 26: platform.v1.CredentialAdminService.GetApiKey:input_type -> platform.v1.CredentialAdminServiceGetApiKeyRequest
-	7,  // 27: platform.v1.CredentialAdminService.RevokeApiKey:input_type -> platform.v1.CredentialAdminServiceRevokeApiKeyRequest
-	9,  // 28: platform.v1.CredentialAdminService.RotateApiKey:input_type -> platform.v1.CredentialAdminServiceRotateApiKeyRequest
-	12, // 29: platform.v1.CredentialAdminService.IssueCertificate:output_type -> platform.v1.IssueCertificateResponse
-	15, // 30: platform.v1.CredentialAdminService.RenewCertificate:output_type -> platform.v1.RenewCertificateResponse
-	17, // 31: platform.v1.CredentialAdminService.RevokeCertificate:output_type -> platform.v1.RevokeCertificateResponse
-	19, // 32: platform.v1.CredentialAdminService.GetCertificate:output_type -> platform.v1.GetCertificateResponse
-	21, // 33: platform.v1.CredentialAdminService.ListCertificates:output_type -> platform.v1.ListCertificatesResponse
-	2,  // 34: platform.v1.CredentialAdminService.MintApiKey:output_type -> platform.v1.CredentialAdminServiceMintApiKeyResponse
-	4,  // 35: platform.v1.CredentialAdminService.ListApiKeys:output_type -> platform.v1.CredentialAdminServiceListApiKeysResponse
-	6,  // 36: platform.v1.CredentialAdminService.GetApiKey:output_type -> platform.v1.CredentialAdminServiceGetApiKeyResponse
-	8,  // 37: platform.v1.CredentialAdminService.RevokeApiKey:output_type -> platform.v1.CredentialAdminServiceRevokeApiKeyResponse
-	10, // 38: platform.v1.CredentialAdminService.RotateApiKey:output_type -> platform.v1.CredentialAdminServiceRotateApiKeyResponse
-	29, // [29:39] is the sub-list for method output_type
-	19, // [19:29] is the sub-list for method input_type
-	19, // [19:19] is the sub-list for extension type_name
-	19, // [19:19] is the sub-list for extension extendee
-	0,  // [0:19] is the sub-list for field type_name
+	22, // 9: platform.v1.CredentialAdminServiceRotateApiKeyRequest.expires_at:type_name -> google.protobuf.Timestamp
+	0,  // 10: platform.v1.CredentialAdminServiceRotateApiKeyResponse.revoked:type_name -> platform.v1.ApiKey
+	0,  // 11: platform.v1.CredentialAdminServiceRotateApiKeyResponse.api_key:type_name -> platform.v1.ApiKey
+	13, // 12: platform.v1.IssueCertificateResponse.cert:type_name -> platform.v1.CertificateSummary
+	22, // 13: platform.v1.CertificateSummary.issued_at:type_name -> google.protobuf.Timestamp
+	22, // 14: platform.v1.CertificateSummary.expires_at:type_name -> google.protobuf.Timestamp
+	22, // 15: platform.v1.CertificateSummary.revoked_at:type_name -> google.protobuf.Timestamp
+	13, // 16: platform.v1.RenewCertificateResponse.cert:type_name -> platform.v1.CertificateSummary
+	13, // 17: platform.v1.RevokeCertificateResponse.cert:type_name -> platform.v1.CertificateSummary
+	13, // 18: platform.v1.GetCertificateResponse.cert:type_name -> platform.v1.CertificateSummary
+	13, // 19: platform.v1.ListCertificatesResponse.certs:type_name -> platform.v1.CertificateSummary
+	11, // 20: platform.v1.CredentialAdminService.IssueCertificate:input_type -> platform.v1.IssueCertificateRequest
+	14, // 21: platform.v1.CredentialAdminService.RenewCertificate:input_type -> platform.v1.RenewCertificateRequest
+	16, // 22: platform.v1.CredentialAdminService.RevokeCertificate:input_type -> platform.v1.RevokeCertificateRequest
+	18, // 23: platform.v1.CredentialAdminService.GetCertificate:input_type -> platform.v1.GetCertificateRequest
+	20, // 24: platform.v1.CredentialAdminService.ListCertificates:input_type -> platform.v1.ListCertificatesRequest
+	1,  // 25: platform.v1.CredentialAdminService.MintApiKey:input_type -> platform.v1.CredentialAdminServiceMintApiKeyRequest
+	3,  // 26: platform.v1.CredentialAdminService.ListApiKeys:input_type -> platform.v1.CredentialAdminServiceListApiKeysRequest
+	5,  // 27: platform.v1.CredentialAdminService.GetApiKey:input_type -> platform.v1.CredentialAdminServiceGetApiKeyRequest
+	7,  // 28: platform.v1.CredentialAdminService.RevokeApiKey:input_type -> platform.v1.CredentialAdminServiceRevokeApiKeyRequest
+	9,  // 29: platform.v1.CredentialAdminService.RotateApiKey:input_type -> platform.v1.CredentialAdminServiceRotateApiKeyRequest
+	12, // 30: platform.v1.CredentialAdminService.IssueCertificate:output_type -> platform.v1.IssueCertificateResponse
+	15, // 31: platform.v1.CredentialAdminService.RenewCertificate:output_type -> platform.v1.RenewCertificateResponse
+	17, // 32: platform.v1.CredentialAdminService.RevokeCertificate:output_type -> platform.v1.RevokeCertificateResponse
+	19, // 33: platform.v1.CredentialAdminService.GetCertificate:output_type -> platform.v1.GetCertificateResponse
+	21, // 34: platform.v1.CredentialAdminService.ListCertificates:output_type -> platform.v1.ListCertificatesResponse
+	2,  // 35: platform.v1.CredentialAdminService.MintApiKey:output_type -> platform.v1.CredentialAdminServiceMintApiKeyResponse
+	4,  // 36: platform.v1.CredentialAdminService.ListApiKeys:output_type -> platform.v1.CredentialAdminServiceListApiKeysResponse
+	6,  // 37: platform.v1.CredentialAdminService.GetApiKey:output_type -> platform.v1.CredentialAdminServiceGetApiKeyResponse
+	8,  // 38: platform.v1.CredentialAdminService.RevokeApiKey:output_type -> platform.v1.CredentialAdminServiceRevokeApiKeyResponse
+	10, // 39: platform.v1.CredentialAdminService.RotateApiKey:output_type -> platform.v1.CredentialAdminServiceRotateApiKeyResponse
+	30, // [30:40] is the sub-list for method output_type
+	20, // [20:30] is the sub-list for method input_type
+	20, // [20:20] is the sub-list for extension type_name
+	20, // [20:20] is the sub-list for extension extendee
+	0,  // [0:20] is the sub-list for field type_name
 }
 
 func init() { file_platform_v1_credential_admin_proto_init() }
