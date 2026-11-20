@@ -171,18 +171,18 @@ func (s *SSOService) parseStateJWT(stateJWT string) (companyID uuid.UUID, provid
 		// Fall back so in-flight logins across a rolling deploy don't 500.
 		subject, err = s.jwtManager.ValidateShortLivedToken(stateJWT)
 		if err != nil {
-			return uuid.Nil, "", "", "", fmt.Errorf("invalid state: %w", err)
+			return uuid.Nil, "", "", "", fmt.Errorf("%w: %w", ErrSSOInvalidState, err)
 		}
 	}
 
 	parts := strings.SplitN(subject, "|", 4)
 	if len(parts) < 3 {
-		return uuid.Nil, "", "", "", fmt.Errorf("malformed state")
+		return uuid.Nil, "", "", "", fmt.Errorf("%w: malformed", ErrSSOInvalidState)
 	}
 
 	companyID, err = uuid.Parse(parts[0])
 	if err != nil {
-		return uuid.Nil, "", "", "", fmt.Errorf("invalid company_id in state")
+		return uuid.Nil, "", "", "", fmt.Errorf("%w: invalid company_id", ErrSSOInvalidState)
 	}
 
 	if len(parts) == 4 {
@@ -198,7 +198,7 @@ func (s *SSOService) parseStateJWT(stateJWT string) (companyID uuid.UUID, provid
 func (s *SSOService) HandleOIDCCallbackWithState(ctx context.Context, code, stateJWT string) (*AuthResponse, string, error) {
 	companyID, provider, redirectURI, verifier, err := s.parseStateJWT(stateJWT)
 	if err != nil {
-		return nil, "", fmt.Errorf("invalid state: %w", err)
+		return nil, "", err
 	}
 
 	resp, err := s.HandleOIDCCallbackWithVerifier(ctx, code, provider, companyID, verifier)
@@ -265,8 +265,9 @@ func (s *SSOService) HandleOIDCCallbackWithVerifier(ctx context.Context, code, p
 
 	// Extract claims
 	var claims struct {
-		Email string `json:"email"`
-		Name  string `json:"name"`
+		Email         string `json:"email"`
+		Name          string `json:"name"`
+		EmailVerified any    `json:"email_verified"`
 	}
 	if err := idToken.Claims(&claims); err != nil {
 		return nil, fmt.Errorf("extract ID token claims: %w", err)
@@ -276,7 +277,7 @@ func (s *SSOService) HandleOIDCCallbackWithVerifier(ctx context.Context, code, p
 		return nil, fmt.Errorf("email claim not found in ID token")
 	}
 
-	authResp, err := s.jitProvision(ctx, claims.Email, claims.Name, ssoConfig)
+	authResp, err := s.jitProvision(ctx, claims.Email, claims.Name, emailVerifiedClaim(claims.EmailVerified), ssoConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -359,7 +360,9 @@ func (s *SSOService) HandleSAMLCallback(r *http.Request, companyID uuid.UUID) (*
 		return nil, fmt.Errorf("email attribute not found in SAML assertion")
 	}
 
-	return s.jitProvision(r.Context(), email, name, ssoConfig)
+	// SAML has no standard email-verified attribute; the IdP's signed
+	// assertion is the attestation, so the JIT policy applies as before.
+	return s.jitProvision(r.Context(), email, name, true, ssoConfig)
 }
 
 // RegisterHTTPHandlers registers SSO callback HTTP handlers on the given mux.
@@ -390,7 +393,11 @@ func (s *SSOService) handleOIDCCallbackHTTP(w http.ResponseWriter, r *http.Reque
 
 	resp, redirectURI, err := s.callback(r.Context(), code, stateJWT)
 	if err != nil {
-		slog.Error("OIDC callback failed", "error", err)
+		if errors.Is(err, ErrSSOInvalidState) {
+			slog.Warn("OIDC callback rejected", "error", err)
+		} else {
+			slog.Error("OIDC callback failed", "error", err)
+		}
 		http.Error(w, "authentication failed", ssoFailureStatus(err))
 		return
 	}
@@ -435,10 +442,14 @@ func (s *SSOService) handleOIDCCallbackHTTP(w http.ResponseWriter, r *http.Reque
 }
 
 // ssoFailureStatus maps an SSO completion error to its HTTP status: a refused
-// login is 403, anything else stays 500. The body is the same either way.
+// login is 403, a state that does not validate is 400, anything else stays
+// 500. The body is the same either way.
 func ssoFailureStatus(err error) int {
 	if errors.Is(err, ErrSSOLoginRefused) {
 		return http.StatusForbidden
+	}
+	if errors.Is(err, ErrSSOInvalidState) {
+		return http.StatusBadRequest
 	}
 	return http.StatusInternalServerError
 }
@@ -559,6 +570,11 @@ func (s *SSOService) handleSAMLMetadataHTTP(w http.ResponseWriter, r *http.Reque
 // "not provisionable here". The specific reason goes to the operator log only.
 var ErrSSOLoginRefused = errors.New("auth: SSO login refused")
 
+// ErrSSOInvalidState is returned when an OIDC callback's state parameter does
+// not validate: wrong signature, expired, or malformed. The caller sent a
+// request this service did not start, so it maps to 400.
+var ErrSSOInvalidState = errors.New("auth: invalid SSO state")
+
 // ErrSSOEmailNotMember is the #74 name for ErrSSOLoginRefused and is the same
 // error value.
 //
@@ -579,11 +595,12 @@ var ErrSSOEmailNotMember = ErrSSOLoginRefused
 //     Joining this company takes an explicit membership (an invite), never an
 //     email match.
 //   - email matches no account: create one and make it a member of companyID,
-//     but only when cfg allows JIT for it (JITEnabled and the email's domain
-//     is in EmailDomainAllowlist; see jitAllowed). Otherwise refuse (#89).
+//     but only when the IdP marked the email verified (#96) and cfg allows
+//     JIT for it (JITEnabled and the email's domain is in
+//     EmailDomainAllowlist; see jitRefusal). Otherwise refuse (#89).
 //
 // Every refusal returns ErrSSOLoginRefused with the same audit record.
-func (s *SSOService) jitProvision(ctx context.Context, email, name string, cfg SSOConfig) (*AuthResponse, error) {
+func (s *SSOService) jitProvision(ctx context.Context, email, name string, emailVerified bool, cfg SSOConfig) (*AuthResponse, error) {
 	companyID, provider := cfg.CompanyID, cfg.Provider
 	email = strings.ToLower(strings.TrimSpace(email))
 	if name == "" {
@@ -592,6 +609,13 @@ func (s *SSOService) jitProvision(ctx context.Context, email, name string, cfg S
 
 	if user, err := s.store.GetUserByEmail(ctx, email); err == nil {
 		return s.signInExistingSSOUser(ctx, user, companyID, provider, email)
+	}
+
+	// The domain allowlist is only meaningful for an address the IdP has
+	// verified, so an unverified (or unstated) email is never provisioned.
+	if !emailVerified {
+		s.auditSSORefusal(ctx, companyID, provider, email, "email_not_verified")
+		return nil, ErrSSOLoginRefused
 	}
 
 	if reason := jitRefusal(cfg, email); reason != "" {
@@ -647,6 +671,20 @@ func (s *SSOService) signInExistingSSOUser(ctx context.Context, user User, compa
 		return nil, ErrSSOLoginRefused
 	}
 	return s.issueSSOTokens(ctx, user, companyID, role.Name, role.RoleLevel)
+}
+
+// emailVerifiedClaim reads an ID token's email_verified claim. It accepts a
+// JSON bool or the string "true" (case-insensitive), which some IdPs send.
+// Anything else, including a missing claim, is false.
+func emailVerifiedClaim(v any) bool {
+	switch v := v.(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(v, "true")
+	default:
+		return false
+	}
 }
 
 // jitRefusal reports why cfg does not allow JIT-provisioning email, or ""
