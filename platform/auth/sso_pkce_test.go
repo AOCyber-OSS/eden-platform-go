@@ -69,6 +69,9 @@ type fakePKCEOP struct {
 	clientID string
 	email    string
 	name     string
+	// emailVerified is the id_token's email_verified claim. nil omits the
+	// claim; newFakePKCEOP defaults it to true (#96).
+	emailVerified any
 
 	mu             sync.Mutex
 	lastTokenForm  url.Values // the form posted to /token by the most recent Exchange
@@ -88,6 +91,8 @@ func newFakePKCEOP(t *testing.T, clientID, email, name string) *fakePKCEOP {
 		clientID: clientID,
 		email:    email,
 		name:     name,
+
+		emailVerified: true,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", op.handleDiscovery)
@@ -192,6 +197,9 @@ func (op *fakePKCEOP) signIDToken() string {
 		"iat":   now.Unix(),
 		"email": op.email,
 		"name":  op.name,
+	}
+	if op.emailVerified != nil {
+		payload["email_verified"] = op.emailVerified
 	}
 	hb, _ := json.Marshal(header)
 	pb, _ := json.Marshal(payload)
