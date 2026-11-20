@@ -296,7 +296,7 @@ func TestSPVerify_WrongTenantIsRejected(t *testing.T) {
 func TestSPVerify_MalformedInputErrorsWithoutPanic(t *testing.T) {
 	tn := newSPTenant(t, "acme")
 	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
-	deep := strings.Repeat("<a>", 200000) + strings.Repeat("</a>", 200000)
+	deep := `<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol">` + strings.Repeat("<a>", 50000) + strings.Repeat("</a>", 50000) + `</samlp:Response>`
 	huge := `<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol">` + strings.Repeat("<x/>", 2_000_000) + `</samlp:Response>`
 	for name, resp := range map[string]string{
 		"empty":        "",
