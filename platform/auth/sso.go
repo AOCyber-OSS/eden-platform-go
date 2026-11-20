@@ -2,16 +2,11 @@ package auth
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
-	"math/big"
 	"net/http"
 	"net/url"
 	"strings"
@@ -19,11 +14,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	platsaml "go.aocyber.ai/eden-platform-go/platform/auth/saml"
 	"go.aocyber.ai/eden-platform-go/platform/rbac"
 
 	gooidc "github.com/coreos/go-oidc/v3/oidc"
-	"github.com/crewjam/saml"
-	"github.com/crewjam/saml/samlsp"
+	saml2 "github.com/russellhaering/gosaml2"
 	"golang.org/x/oauth2"
 )
 
@@ -36,9 +31,6 @@ type SSOService struct {
 	// Cached providers
 	oidcMu        sync.RWMutex
 	oidcProviders map[string]*oidcCachedProvider
-
-	// SAML SP certificate (auto-generated for dev)
-	samlCert tls.Certificate
 
 	// callback is the code+state → tokens completion used by the OIDC HTTP
 	// callback handler. It defaults to HandleOIDCCallbackWithState; tests inject
@@ -82,14 +74,6 @@ func NewSSOService(store AuthStore, jwtManager *JWTManager, baseURL string) *SSO
 		egress:        defaultSSOEgress(),
 	}
 	svc.callback = svc.HandleOIDCCallbackWithState
-
-	// Generate self-signed SAML SP certificate for development
-	cert, err := generateSelfSignedCert()
-	if err != nil {
-		slog.Warn("failed to generate SAML SP certificate", "error", err)
-	} else {
-		svc.samlCert = cert
-	}
 
 	return svc
 }
@@ -320,23 +304,30 @@ func (s *SSOService) InitiateSAML(ctx context.Context, companyID uuid.UUID) (str
 		return "", fmt.Errorf("SAML not configured for this company")
 	}
 
-	sp, err := s.createSAMLSP(ctx, ssoConfig)
+	trust, err := s.samlTrust(ctx, ssoConfig)
 	if err != nil {
 		return "", fmt.Errorf("create SAML SP: %w", err)
 	}
 
-	// Build AuthnRequest
-	authnReq, err := sp.MakeAuthenticationRequest(sp.GetSSOBindingLocation(saml.HTTPRedirectBinding), saml.HTTPRedirectBinding, saml.HTTPPostBinding)
+	ssoURL := trust.idp.SSOLocation(platsaml.BindingHTTPRedirect)
+	if ssoURL == "" {
+		return "", fmt.Errorf("create SAML authn request: IdP metadata has no HTTP-Redirect SingleSignOnService")
+	}
+	sp := &saml2.SAMLServiceProvider{
+		IdentityProviderSSOURL:      ssoURL,
+		IdentityProviderIssuer:      trust.idp.EntityID,
+		ServiceProviderIssuer:       trust.spEntityID,
+		AssertionConsumerServiceURL: trust.acsURL,
+	}
+	doc, err := sp.BuildAuthRequestDocumentNoSig()
 	if err != nil {
 		return "", fmt.Errorf("create SAML authn request: %w", err)
 	}
-
-	redirectURL, err := authnReq.Redirect("", sp)
+	redirectURL, err := sp.BuildAuthURLRedirect("", doc)
 	if err != nil {
 		return "", fmt.Errorf("build SAML redirect URL: %w", err)
 	}
-
-	return redirectURL.String(), nil
+	return redirectURL, nil
 }
 
 // HandleSAMLCallback processes a SAML assertion from an HTTP request.
@@ -346,19 +337,23 @@ func (s *SSOService) HandleSAMLCallback(r *http.Request, companyID uuid.UUID) (*
 		return nil, fmt.Errorf("SAML not configured for this company")
 	}
 
-	sp, err := s.createSAMLSP(r.Context(), ssoConfig)
+	trust, err := s.samlTrust(r.Context(), ssoConfig)
 	if err != nil {
 		return nil, fmt.Errorf("create SAML SP: %w", err)
 	}
 
-	assertion, err := sp.ParseResponse(r, []string{})
+	// The service issues AuthnRequests without tracking their IDs, so no
+	// response can be bound to one: RequireInResponseTo with no RequestIDs
+	// refuses every response, as the previous verifier did (#87).
+	verifier := trust.idp.Verifier(trust.spEntityID, trust.acsURL)
+	assertion, err := verifier.Verify(r.Context(), r.PostFormValue("SAMLResponse"), platsaml.VerifyOptions{RequireInResponseTo: true})
 	if err != nil {
 		return nil, fmt.Errorf("validate SAML assertion: %w", err)
 	}
 
 	// Extract attributes
-	email := getAssertionAttribute(assertion, "email", "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress")
-	name := getAssertionAttribute(assertion, "displayName", "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name")
+	email := assertion.Attribute("email", "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress")
+	name := assertion.Attribute("displayName", "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name")
 
 	if email == "" {
 		return nil, fmt.Errorf("email attribute not found in SAML assertion")
@@ -774,7 +769,22 @@ func (s *SSOService) getOrCreateOIDCProvider(ctx context.Context, cfg SSOConfig)
 	return cached, nil
 }
 
-func (s *SSOService) createSAMLSP(ctx context.Context, cfg SSOConfig) (*saml.ServiceProvider, error) {
+// maxSAMLMetadataBytes bounds an IdP metadata document fetched from a
+// tenant-controlled URL.
+const maxSAMLMetadataBytes = 4 << 20
+
+// samlTrust is one tenant's SAML trust pair: the IdP's metadata and the SP
+// entity ID / ACS URL this service presents.
+type samlTrust struct {
+	idp        *platsaml.IDPMetadata
+	spEntityID string
+	acsURL     string
+}
+
+// samlTrust fetches the tenant's IdP metadata through the egress guard and
+// derives this SP's entity ID (<baseURL>/auth/saml/metadata) and ACS URL
+// (<baseURL>/auth/saml/acs).
+func (s *SSOService) samlTrust(ctx context.Context, cfg SSOConfig) (*samlTrust, error) {
 	if cfg.MetadataURL == "" {
 		return nil, fmt.Errorf("SAML metadata URL not configured")
 	}
@@ -791,72 +801,37 @@ func (s *SSOService) createSAMLSP(ctx context.Context, cfg SSOConfig) (*saml.Ser
 		return nil, fmt.Errorf("parse base URL: %w", err)
 	}
 
-	idpMetadata, err := samlsp.FetchMetadata(ctx, s.egress.client, *metadataURL)
+	md, err := s.fetchSAMLMetadata(ctx, metadataURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetch IdP metadata: %w", err)
 	}
 
-	sp := saml.ServiceProvider{
-		Key:         s.samlCert.PrivateKey.(*rsa.PrivateKey),
-		Certificate: s.samlCert.Leaf,
-		MetadataURL: *rootURL,
-		AcsURL:      *rootURL,
-		IDPMetadata: idpMetadata,
-	}
-	sp.AcsURL.Path = "/auth/saml/acs"
-	sp.MetadataURL.Path = "/auth/saml/metadata"
-
-	return &sp, nil
+	sp := *rootURL
+	sp.Path = "/auth/saml/metadata"
+	acs := *rootURL
+	acs.Path = "/auth/saml/acs"
+	return &samlTrust{idp: md, spEntityID: sp.String(), acsURL: acs.String()}, nil
 }
 
-func getAssertionAttribute(assertion *saml.Assertion, names ...string) string {
-	if assertion == nil {
-		return ""
-	}
-	for _, stmt := range assertion.AttributeStatements {
-		for _, attr := range stmt.Attributes {
-			for _, name := range names {
-				if attr.Name == name || attr.FriendlyName == name {
-					if len(attr.Values) > 0 {
-						return attr.Values[0].Value
-					}
-				}
-			}
-		}
-	}
-	return ""
-}
-
-func generateSelfSignedCert() (tls.Certificate, error) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
+func (s *SSOService) fetchSAMLMetadata(ctx context.Context, u *url.URL) (*platsaml.IDPMetadata, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("generate RSA key: %w", err)
+		return nil, err
 	}
-
-	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			CommonName: "Eden Platform SAML SP",
-		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		BasicConstraintsValid: true,
-	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	resp, err := s.egress.client.Do(req)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("create certificate: %w", err)
+		return nil, err
 	}
-
-	leaf, err := x509.ParseCertificate(certDER)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("metadata endpoint returned HTTP %d", resp.StatusCode)
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxSAMLMetadataBytes+1))
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("parse certificate: %w", err)
+		return nil, err
 	}
-
-	return tls.Certificate{
-		Certificate: [][]byte{certDER},
-		PrivateKey:  key,
-		Leaf:        leaf,
-	}, nil
+	if len(raw) > maxSAMLMetadataBytes {
+		return nil, fmt.Errorf("metadata exceeds %d bytes", maxSAMLMetadataBytes)
+	}
+	return platsaml.ParseIDPMetadata(raw)
 }

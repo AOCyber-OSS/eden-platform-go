@@ -18,7 +18,8 @@ platform/auth/saml/
 
 For the high-level orchestrated SP flow (tenant-configured SAML SSO with
 attribute mapping, JIT user provisioning, refresh-token issuance), use
-`platform/auth.SSOService` — it wraps crewjam/saml with company-aware
+`platform/auth.SSOService` — it wraps this package's gosaml2-backed
+`Verifier` with company-aware
 configuration and is the recommended entry point for most callers.
 
 For the lower-level primitives in this package, see:
@@ -57,7 +58,7 @@ into AOC apps:
 
 2. The platform service constructs an AuthnRequest, redirects the user to
    the customer's IdP, validates the returned assertion (using
-   crewjam/saml's signature-verifying SP), and JIT-provisions the user
+   this package's signature-verifying `Verifier`), and JIT-provisions the user
    into the company.
 
 This direction is fully covered by `platform/auth.SSOService` — you do
@@ -84,7 +85,8 @@ skew tolerance is at least 60 seconds (most SPs default to 60 or 180s).
 See [`idp/README.md`](./idp/README.md) for the full IdP security
 checklist (replay protection, audience restriction, time skew, NameID
 privacy, signing cert provisioning). For SP-side security, the
-`SSOService` and crewjam/saml together provide signature verification,
-audience validation, and replay defense out of the box; treat the
-lower-level `ParseResponse` helper here as a primitive that does NOT
-verify signatures — see its docstring.
+`Verifier` (gosaml2 + goxmldsig) provides signature verification, issuer,
+audience, destination/recipient and validity-window checks, request-ID
+binding and, when given a `ReplayCache`, replay refusal. `VerifyResponse`
+and `SSOService` both use it. Treat `ParseResponseUnverified` as a primitive
+that does NOT verify signatures — see its docstring.

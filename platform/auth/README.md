@@ -11,7 +11,7 @@ platform/auth/
 │                          full-fat orchestration layer
 │   ├── jwt.go            ML-DSA-65 (post-quantum) signed JWTs with rotation
 │   ├── service.go        SignUp / Login / RefreshToken / Logout / UpdateProfile
-│   ├── sso.go            OIDC + SAML SP wrapper using crewjam/saml + go-oidc
+│   ├── sso.go            OIDC + SAML SP wrapper using gosaml2 (via saml.Verifier) + go-oidc
 │   ├── password.go       Argon2id PasswordHasher (recommended for new work)
 │   ├── legacy_bcrypt.go  bcrypt helpers (Devise-compatible) for migration
 │   ├── require.go        HTTP middleware
